@@ -37,9 +37,9 @@ max_frames=12
 temperature_new=1.0
 resume=None
 load_from_pretrained=0
-batch_size=16           # single GPU batch size
+batch_size=32           # single GPU batch size
 batch_size_val=16
-num_workers=4
+num_workers=8
 n_display=50            # log per n_display
 precision=amp
 
