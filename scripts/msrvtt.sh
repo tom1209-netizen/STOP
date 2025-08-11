@@ -1,5 +1,5 @@
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0
 echo "Using local machine for training"
 
 
@@ -11,14 +11,14 @@ group=group2-2
 dataset=msrvtt
 fps=3
 
-DATA_PATH=/kaggle/input/msrvtt
+DATA_PATH=/content/MSRVTT
 data_path=${DATA_PATH}/annotation/MSRVTT_data.json
 train_csv=${DATA_PATH}/annotation/MSRVTT_train.9k.csv
 
 # training-9k
 val_csv=${DATA_PATH}/annotation/MSRVTT_JSFUSION_test.csv
 features_path=${DATA_PATH}/compressed_videos/
-pretrained_dir=/kaggle/input/stop-model-implementation/modules
+pretrained_dir=/content/stop-implementation/modules
 
 # train or eval
 do_train=1
@@ -49,13 +49,13 @@ time_embedding=0
 shared_latent_space=transformer
 
 # distributed training
-init_method='tcp://127.0.0.1:6010'
+# init_method='tcp://127.0.0.1:6010'
 
 
 
 
-current_datetime=$(TZ="Asia/Shanghai" date +"%Y-%m-%d-%H:%M:%S")
-model_dir=/kaggle/working/logs/${current_datetime}_${dataset}_STOP
+current_datetime=$(TZ="Asia/Tokyo" date +"%Y-%m-%d-%H:%M:%S")
+model_dir=/content/logs/${current_datetime}_${dataset}_STOP
 echo "The model dir is ${model_dir}"
 # CUDA_LAUNCH_BLOCKING=1
 python  main.py \
@@ -87,7 +87,6 @@ python  main.py \
         --sim_header meanP \
         --pretrained_clip_name ${pretrained_clip_name} \
         --precision ${precision} \
-        --init_method ${init_method} \
         --pretrained_dir ${pretrained_dir} \
         --freeze_clip ${freeze_clip} \
         --time_embedding ${time_embedding} \
