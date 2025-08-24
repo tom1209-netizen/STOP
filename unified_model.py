@@ -377,6 +377,130 @@ class UnifiedTempMeSTOPModel(nn.Module):
         except Exception as e:
             logger.error(f"Error in retrieve_event: {e}")
             raise
+    
+    def compute_training_loss(self, video_tensor: torch.Tensor, video_mask: torch.Tensor,
+                             input_ids: torch.Tensor, attention_mask: torch.Tensor, 
+                             token_type_ids: torch.Tensor) -> dict:
+        """
+        Compute training loss for the unified model.
+        
+        Args:
+            video_tensor: Video frames [B, T, C, H, W]
+            video_mask: Video mask [B, T]
+            input_ids: Text tokens [B, L]
+            attention_mask: Text attention mask [B, L] 
+            token_type_ids: Token type IDs [B, L]
+            
+        Returns:
+            Dictionary containing loss components
+        """
+        batch_size = video_tensor.size(0)
+        
+        # Compress frames using TempMe for each video in batch
+        compressed_videos = []
+        compressed_masks = []
+        
+        for i in range(batch_size):
+            compressed_frames, compressed_mask = self.compress_frames_with_tempme(
+                video_tensor[i], video_mask[i]
+            )
+            compressed_videos.append(compressed_frames)
+            compressed_masks.append(compressed_mask)
+        
+        # Stack compressed videos
+        compressed_video_batch = torch.stack(compressed_videos)  # [B, max_frames, C, H, W]
+        compressed_mask_batch = torch.stack(compressed_masks)    # [B, max_frames]
+        
+        # Prepare for STOP model (add pair dimension)
+        video_input = compressed_video_batch.unsqueeze(1)  # [B, 1, max_frames, C, H, W]
+        
+        # Run STOP model for training
+        if self.stop_model is not None:
+            output = self.stop_model(
+                input_ids=input_ids,
+                token_type_ids=token_type_ids,
+                attention_mask=attention_mask,
+                video=video_input,
+                video_mask=compressed_mask_batch
+            )
+            
+            # Extract loss components
+            loss_dict = {
+                'total_loss': output.get('loss', torch.tensor(0.0)),
+                'sim_loss': output.get('sim_loss', torch.tensor(0.0)),
+            }
+            
+            # Add TempMe specific losses if available
+            if 'tempme_loss' in output:
+                loss_dict['tempme_loss'] = output['tempme_loss']
+                
+        else:
+            # Fallback loss computation
+            logger.warning("STOP model not available, using dummy loss")
+            loss_dict = {
+                'total_loss': torch.tensor(0.0, requires_grad=True),
+                'sim_loss': torch.tensor(0.0, requires_grad=True),
+            }
+        
+        return loss_dict
+    
+    def freeze_tempme(self):
+        """Freeze TempMe parameters for STOP-only training."""
+        if self.tempme_model is not None:
+            for param in self.tempme_model.parameters():
+                param.requires_grad = False
+            logger.info("TempMe parameters frozen")
+    
+    def freeze_stop(self):
+        """Freeze STOP parameters for TempMe-only training.""" 
+        if self.stop_model is not None:
+            for param in self.stop_model.parameters():
+                param.requires_grad = False
+            logger.info("STOP parameters frozen")
+    
+    def unfreeze_all(self):
+        """Unfreeze all parameters for joint training."""
+        for param in self.parameters():
+            param.requires_grad = True
+        logger.info("All parameters unfrozen for joint training")
+    
+    def get_trainable_parameters(self):
+        """Get trainable parameters for optimizer."""
+        return [p for p in self.parameters() if p.requires_grad]
+    
+    def get_parameter_groups(self, tempme_lr: float = 1e-4, stop_lr: float = 1e-5):
+        """
+        Get parameter groups with different learning rates.
+        
+        Args:
+            tempme_lr: Learning rate for TempMe parameters
+            stop_lr: Learning rate for STOP parameters
+            
+        Returns:
+            List of parameter groups for optimizer
+        """
+        tempme_params = []
+        stop_params = []
+        
+        # Collect TempMe parameters
+        if self.tempme_model is not None:
+            for name, param in self.tempme_model.named_parameters():
+                if param.requires_grad:
+                    tempme_params.append(param)
+        
+        # Collect STOP parameters  
+        if self.stop_model is not None:
+            for name, param in self.stop_model.named_parameters():
+                if param.requires_grad:
+                    stop_params.append(param)
+        
+        param_groups = []
+        if tempme_params:
+            param_groups.append({'params': tempme_params, 'lr': tempme_lr, 'name': 'tempme'})
+        if stop_params:
+            param_groups.append({'params': stop_params, 'lr': stop_lr, 'name': 'stop'})
+            
+        return param_groups
 
 
 def create_unified_model(config_path: str = None, device: str = 'cuda') -> UnifiedTempMeSTOPModel:

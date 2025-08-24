@@ -74,12 +74,57 @@ class STOPConfig:
 
 
 @dataclass
+class UnifiedTrainingConfig:
+    """Configuration for training the unified model."""
+    
+    # Training strategy
+    training_mode: str = "joint"  # "joint", "tempme_only", "stop_only", "sequential"
+    
+    # Learning rates
+    tempme_lr: float = 1e-4
+    stop_lr: float = 1e-5
+    
+    # Training parameters
+    batch_size: int = 8
+    num_epochs: int = 10
+    warmup_epochs: int = 1
+    
+    # Optimization
+    optimizer: str = "AdamW"  # "AdamW", "BertAdam"
+    weight_decay: float = 0.01
+    gradient_accumulation_steps: int = 1
+    max_grad_norm: float = 1.0
+    
+    # Scheduler
+    scheduler: str = "cosine"  # "cosine", "linear", "constant"
+    
+    # Loss weights
+    tempme_loss_weight: float = 1.0
+    stop_loss_weight: float = 1.0
+    
+    # Checkpointing
+    save_every_n_epochs: int = 2
+    checkpoint_dir: str = "./checkpoints"
+    
+    # Evaluation
+    eval_every_n_epochs: int = 1
+    
+    # Data
+    train_data_path: str = ""
+    val_data_path: str = ""
+    datatype: str = "msrvtt"  # "msrvtt", "didemo", "activitynet", "vatex"
+
+
+@dataclass
 class UnifiedModelConfig:
     """Configuration for the unified TempMe-STOP model."""
     
     # Sub-module configurations
     tempme: TempMeConfig = None
     stop: STOPConfig = None
+    
+    # Training configuration
+    training: UnifiedTrainingConfig = None
     
     # Unified model parameters
     device: str = "cuda"
@@ -100,6 +145,8 @@ class UnifiedModelConfig:
             self.tempme = TempMeConfig()
         if self.stop is None:
             self.stop = STOPConfig()
+        if self.training is None:
+            self.training = UnifiedTrainingConfig()
     
     @classmethod
     def from_json(cls, config_path: str) -> 'UnifiedModelConfig':
@@ -115,11 +162,16 @@ class UnifiedModelConfig:
         stop_dict = config_dict.get('stop', {})
         stop_config = STOPConfig(**stop_dict)
         
+        # Parse training config
+        training_dict = config_dict.get('training', {})
+        training_config = UnifiedTrainingConfig(**training_dict)
+        
         # Parse unified config
         unified_dict = {k: v for k, v in config_dict.items() 
-                       if k not in ['tempme', 'stop']}
+                       if k not in ['tempme', 'stop', 'training']}
         unified_dict['tempme'] = tempme_config
         unified_dict['stop'] = stop_config
+        unified_dict['training'] = training_config
         
         return cls(**unified_dict)
     
@@ -129,6 +181,7 @@ class UnifiedModelConfig:
         config_dict = {
             'tempme': self.tempme.__dict__,
             'stop': self.stop.__dict__,
+            'training': self.training.__dict__,
             'device': self.device,
             'max_frames': self.max_frames,
             'video_size': self.video_size,

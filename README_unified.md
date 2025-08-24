@@ -238,6 +238,99 @@ Inference time: 1.15s
 }
 ```
 
+## 🎓 Training the Unified Model
+
+The unified TempMe-STOP model supports multiple training strategies for optimal performance and flexibility.
+
+### Quick Training Start
+
+1. **Prepare your configuration**:
+```bash
+# Copy sample configuration
+cp configs/training_config.json configs/my_config.json
+# Edit data paths and training parameters in my_config.json
+```
+
+2. **Start training**:
+```bash
+# Joint training (recommended) - train both modules together
+python train_unified_model.py --config configs/my_config.json --mode joint
+
+# Train only TempMe module
+python train_unified_model.py --config configs/my_config.json --mode tempme_only
+
+# Train only STOP module  
+python train_unified_model.py --config configs/my_config.json --mode stop_only
+
+# Sequential training (TempMe first, then STOP)
+python train_unified_model.py --config configs/my_config.json --mode sequential
+```
+
+### Training Modes
+
+- **Joint Training**: Train both modules end-to-end (best performance)
+- **Individual Training**: Train specific modules only (useful for fine-tuning)
+- **Sequential Training**: Train modules in sequence (stable, lower memory usage)
+
+### Quick Example
+
+```python
+# Simple training example
+python training_example.py
+```
+
+This will guide you through different training options interactively.
+
+### Training Configuration
+
+Key training parameters in `configs/training_config.json`:
+
+```json
+{
+  "training": {
+    "training_mode": "joint",        // "joint", "tempme_only", "stop_only", "sequential"
+    "tempme_lr": 1e-4,              // Learning rate for TempMe module
+    "stop_lr": 1e-5,                // Learning rate for STOP module
+    "batch_size": 8,                // Batch size (adjust based on GPU memory)
+    "num_epochs": 20,               // Number of training epochs
+    "datatype": "msrvtt",           // Dataset type
+    "checkpoint_dir": "./checkpoints/unified_model"
+  }
+}
+```
+
+### Monitoring Training
+
+Monitor training progress with TensorBoard:
+```bash
+tensorboard --logdir checkpoints/unified_model/logs
+```
+
+Key metrics to watch:
+- Training/validation loss
+- Learning rates for both modules
+- Gradient norms
+
+### Resume Training
+
+Resume from a checkpoint:
+```bash
+python train_unified_model.py \
+    --config configs/my_config.json \
+    --mode joint \
+    --resume checkpoints/unified_model/checkpoint_epoch_10.pth
+```
+
+### Advanced Training Features
+
+- **Mixed Precision Training**: Enabled by default for faster training
+- **Gradient Accumulation**: Simulate larger batches
+- **Different Learning Rates**: Separate rates for TempMe and STOP modules
+- **Multiple GPU Support**: Distributed training ready
+- **Custom Loss Functions**: Extensible training framework
+
+For complete training documentation, see [TRAINING_GUIDE.md](TRAINING_GUIDE.md).
+
 ## 🐛 Troubleshooting
 
 ### Common Issues
@@ -284,10 +377,15 @@ python inference.py --demo
 ├── unified_model.py              # Main unified model implementation
 ├── inference.py                 # Command-line interface and API
 ├── config.py                   # Configuration classes
+├── train_unified_model.py      # Comprehensive training script
+├── training_example.py         # Simple training examples
 ├── configs/
-│   └── unified_model_config.json # Default configuration
+│   ├── unified_model_config.json # Default inference configuration
+│   └── training_config.json    # Training configuration template
 ├── sample_batch.json           # Example batch file
-└── README_unified.md          # This documentation
+├── TRAINING_GUIDE.md          # Complete training documentation
+├── README_unified.md          # This documentation
+└── checkpoints/               # Training checkpoints and logs
 ```
 
 ## 🔬 Technical Details
