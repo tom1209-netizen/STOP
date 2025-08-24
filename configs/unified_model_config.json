@@ -1,0 +1,54 @@
+{
+  "tempme": {
+    "base_encoder": "ViT-B/32",
+    "pretrained_path": "./pretrained",
+    "lora_dim": 8,
+    "tome_r": 2,
+    "merge_frame_num": "2-2-2",
+    "merge_layer": [
+      6,
+      8,
+      10
+    ],
+    "merge_token_proportion": [
+      0.3,
+      0.7
+    ],
+    "frame_list": [
+      32,
+      16,
+      8,
+      4
+    ],
+    "patch_list": [
+      197,
+      98,
+      49,
+      25
+    ],
+    "frame_pos": 1
+  },
+  "stop": {
+    "cross_model": "cross-base",
+    "pretrained_clip_name": "ViT-B/32",
+    "pretrained_dir": "./pretrained",
+    "cache_dir": "./cache",
+    "freeze_clip": false,
+    "freeze_layer_num": 0,
+    "sim_header": "meanP",
+    "pre_visual_pooling": false,
+    "temporal_prompt": "group2-2",
+    "new_added_modules": [
+      "prompt",
+      "temporal"
+    ],
+    "loss_type": "CrossEn"
+  },
+  "device": "cuda",
+  "max_frames": 12,
+  "video_size": 224,
+  "video_fps": 3.0,
+  "num_segments": 32,
+  "top_k": 5,
+  "similarity_threshold": 0.5
+}

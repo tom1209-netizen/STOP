@@ -1,0 +1,22 @@
+[
+    {
+        "video_path": "./sample_videos/dog_running.mp4",
+        "query": "The dog is running in the park"
+    },
+    {
+        "video_path": "./sample_videos/person_walking.mp4", 
+        "query": "A person walking down the street"
+    },
+    {
+        "video_path": "./sample_videos/car_driving.mp4",
+        "query": "A car driving on the highway"
+    },
+    {
+        "video_path": "./sample_videos/cooking.mp4",
+        "query": "Someone is cooking in the kitchen"
+    },
+    {
+        "video_path": "./sample_videos/soccer.mp4",
+        "query": "Players kicking a soccer ball"
+    }
+]
