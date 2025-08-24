@@ -1,23 +1,24 @@
 # 🚀 Unified TempMe-STOP Model
 
-**End-to-end temporal video event retrieval with integrated frame compression and query-based retrieval.**
+**Batch video embedding extraction using integrated TempMe frame compression and visual encoding.**
 
 ## ✨ Overview
 
-This unified model combines TempMe (frame compression) and STOP (retrieval) modules into a single pipeline for efficient temporal video event retrieval. The system takes raw video and natural language queries as input and returns relevant frame sequences.
+This unified model combines TempMe (frame compression) and STOP (visual encoding) modules to extract meaningful video embeddings from entire directories of videos. The system processes video files efficiently and outputs high-quality embeddings suitable for downstream tasks.
 
 ### 🏗️ Architecture
 
 ```
-Input Video → Frame Sampling → TempMe Compression (N→12) → STOP Retrieval → Output Frames
+Input Videos → Frame Sampling → TempMe Compression (N→12) → Visual Encoding → Video Embeddings
 ```
 
 ### Key Benefits
 
-- **End-to-end Processing**: Single model handles entire pipeline
-- **Intelligent Compression**: TempMe reduces N frames to 12 representatives
-- **Accurate Retrieval**: STOP provides precise temporal event detection
-- **Efficient**: ~40% faster than separate module calls
+- **Batch Processing**: Extract embeddings from entire video directories
+- **Intelligent Compression**: TempMe reduces N frames to 12 representatives  
+- **Rich Representations**: STOP visual encoder produces meaningful embeddings
+- **Efficient**: Optimized pipeline for large-scale video processing
+- **Flexible Output**: Multiple embedding formats (numpy, JSON, consolidated)
 
 ## 🚀 Quick Start
 
@@ -35,66 +36,106 @@ python -c "from unified_model import create_unified_model; print('Installation s
 ### Basic Usage
 
 ```bash
-# Single query
-python inference.py --video_path video.mp4 --query "The dog is running"
+# Extract embeddings from all videos in a directory
+python extract_video_embeddings.py --video_dir ./videos --output_dir ./embeddings
 
-# Batch processing
-python inference.py --batch_file sample_batch.json --output_file results.json
+# With custom configuration
+python extract_video_embeddings.py --video_dir ./videos --output_dir ./embeddings --config_path ./configs/custom_config.json
 
-# Demo mode
-python inference.py --demo
+# Save in consolidated format
+python extract_video_embeddings.py --video_dir ./videos --output_dir ./embeddings --consolidated
+
+# Get processing summary
+python extract_video_embeddings.py --video_dir ./videos --output_dir ./embeddings --summary
 ```
 
 ### Python API
 
 ```python
 from unified_model import create_unified_model
-from inference import retrieve_event
+import numpy as np
 
-# Method 1: Direct API call
-frames = retrieve_event("video.mp4", "The dog is running")
-print(f"Relevant frames: {frames}")
-
-# Method 2: Using pre-loaded model
+# Method 1: Extract single video embedding
 model = create_unified_model("./configs/unified_model_config.json")
-frames = retrieve_event("video.mp4", "A person walking", model=model)
+embedding = model.extract_video_embedding("video.mp4")
+print(f"Video embedding shape: {embedding.shape}")
+
+# Method 2: Batch processing from script
+from extract_video_embeddings import extract_directory_embeddings
+
+results = extract_directory_embeddings(
+    video_dir="./videos",
+    output_dir="./embeddings", 
+    save_format="both",  # Save as both numpy and JSON
+    consolidated=True    # Also create consolidated file
+)
+print(f"Processed {results['processed']} videos successfully")
 ```
 
 ## 📋 Command Line Interface
 
-### Single Inference
+### Basic Embedding Extraction
 
 ```bash
-python inference.py \
-    --video_path path/to/video.mp4 \
-    --query "Natural language description" \
-    --top_k 5 \
-    --device cuda \
+python extract_video_embeddings.py \
+    --video_dir path/to/videos \
+    --output_dir path/to/embeddings \
     --config_path configs/unified_model_config.json \
-    --output_file results.json
+    --device cuda
 ```
 
-### Batch Processing
+### Advanced Options
 
 ```bash
-python inference.py \
-    --batch_file batch_queries.json \
-    --output_file batch_results.json \
-    --config_path configs/unified_model_config.json
+python extract_video_embeddings.py \
+    --video_dir path/to/videos \
+    --output_dir path/to/embeddings \
+    --save_format both \        # Save as numpy and JSON
+    --consolidated \            # Create consolidated file  
+    --summary                   # Save processing summary
 ```
 
-**Sample batch file format:**
+### Output Formats
+
+### Output Formats
+
+The script supports multiple output formats:
+
+**Individual numpy files:**
+```
+embeddings/
+├── video1_embedding.npy
+├── video2_embedding.npy
+└── video3_embedding.npy
+```
+
+**Individual JSON files:**
 ```json
-[
-    {
-        "video_path": "./videos/video1.mp4",
-        "query": "A person walking down the street"
-    },
-    {
-        "video_path": "./videos/video2.mp4", 
-        "query": "A dog running in the park"
+{
+  "video_path": "./videos/video1.mp4",
+  "embedding": [0.1, 0.2, ...],
+  "shape": [512], 
+  "dtype": "float32"
+}
+```
+
+**Consolidated format:**
+```json
+{
+  "embeddings": {
+    "video1": {
+      "embedding": [0.1, 0.2, ...],
+      "shape": [512],
+      "video_path": "./videos/video1.mp4"
     }
-]
+  },
+  "metadata": {
+    "total_videos": 10,
+    "successful": 10,
+    "failed": 0,
+    "processing_date": "2024-01-15 10:30:00"
+  }
+}
 ```
 
 ## ⚙️ Configuration

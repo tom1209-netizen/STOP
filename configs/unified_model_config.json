@@ -48,7 +48,5 @@
   "max_frames": 12,
   "video_size": 224,
   "video_fps": 3.0,
-  "num_segments": 32,
-  "top_k": 5,
-  "similarity_threshold": 0.5
+  "num_segments": 32
 }

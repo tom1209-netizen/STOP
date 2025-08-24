@@ -83,6 +83,7 @@ def test_unified_model_structure():
         assert hasattr(model, 'retrieve_with_stop')
         assert hasattr(model, 'forward')
         assert hasattr(model, 'retrieve_event')
+        assert hasattr(model, 'extract_video_embedding')
         print("✓ All required methods exist")
         
         print("✓ Unified model structure tests passed\n")
@@ -156,40 +157,38 @@ def test_dummy_inference():
         return False
 
 
-def test_inference_api():
-    """Test the inference API."""
+def test_embedding_extraction():
+    """Test the video embedding extraction functionality."""
     print("="*60)
-    print("TESTING INFERENCE API")
+    print("TESTING VIDEO EMBEDDING EXTRACTION")
     print("="*60)
     
     try:
-        from inference import retrieve_event, batch_retrieve_events
+        from unified_model import create_unified_model
         
-        # Test single inference API
-        frames = retrieve_event(
-            video_path="dummy_video.mp4",
-            query="A person walking",
-            device='cpu'
-        )
-        assert isinstance(frames, list)
-        print(f"✓ Single inference API works: {frames}")
+        # Create model with CPU for testing
+        model = create_unified_model(device='cpu')
+        model.eval()
+        print("✓ Model initialized for testing")
         
-        # Test batch inference API
-        video_queries = [
-            {"video_path": "dummy1.mp4", "query": "walking"},
-            {"video_path": "dummy2.mp4", "query": "running"}
-        ]
+        # Test embedding extraction
+        dummy_video_path = "dummy_video.mp4"
+        embedding = model.extract_video_embedding(dummy_video_path)
         
-        results = batch_retrieve_events(video_queries, device='cpu')
-        assert isinstance(results, list)
-        assert len(results) == 2
-        print(f"✓ Batch inference API works: {len(results)} results")
+        assert isinstance(embedding, torch.Tensor)
+        assert embedding.ndim == 1  # Should be 1D embedding vector
+        print(f"✓ Video embedding extraction works: shape {embedding.shape}")
         
-        print("✓ Inference API tests passed\n")
+        # Test that embeddings are deterministic (same input = same output)
+        embedding2 = model.extract_video_embedding(dummy_video_path)
+        assert torch.allclose(embedding, embedding2, atol=1e-5)
+        print("✓ Embedding extraction is deterministic")
+        
+        print("✓ Embedding extraction tests passed\n")
         return True
         
     except Exception as e:
-        print(f"✗ Inference API test failed: {e}")
+        print(f"✗ Embedding extraction test failed: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -234,31 +233,46 @@ def test_batch_file_processing():
         return False
 
 
-def test_command_line_interface():
-    """Test command line interface structure."""
+def test_extraction_script():
+    """Test extraction script structure."""
     print("="*60)
-    print("TESTING COMMAND LINE INTERFACE")
+    print("TESTING EXTRACTION SCRIPT")
     print("="*60)
     
     try:
-        # Test importing the main inference module
-        import inference
+        # Test importing the extraction script
+        import extract_video_embeddings
         
         # Check if main functions exist
-        assert hasattr(inference, 'retrieve_event')
-        assert hasattr(inference, 'batch_retrieve_events')
-        assert hasattr(inference, 'main')
-        print("✓ CLI module structure is correct")
+        assert hasattr(extract_video_embeddings, 'extract_single_video_embedding')
+        assert hasattr(extract_video_embeddings, 'extract_directory_embeddings')
+        assert hasattr(extract_video_embeddings, 'get_video_files')
+        assert hasattr(extract_video_embeddings, 'save_embedding')
+        assert hasattr(extract_video_embeddings, 'main')
+        print("✓ Extraction script structure is correct")
         
-        # Test demo mode (without actually running it)
-        assert hasattr(inference, 'demo_inference')
-        print("✓ Demo functionality exists")
+        # Test video file detection
+        import tempfile
+        import os
         
-        print("✓ Command line interface tests passed\n")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Create dummy video files
+            for ext in ['.mp4', '.avi', '.txt']:  # .txt should be ignored
+                dummy_file = os.path.join(temp_dir, f'test{ext}')
+                with open(dummy_file, 'w') as f:
+                    f.write('dummy')
+            
+            video_files = extract_video_embeddings.get_video_files(temp_dir)
+            assert len(video_files) == 2  # Only .mp4 and .avi should be detected
+            print(f"✓ Video file detection works: found {len(video_files)} video files")
+        
+        print("✓ Extraction script tests passed\n")
         return True
         
     except Exception as e:
-        print(f"✗ Command line interface test failed: {e}")
+        print(f"✗ Extraction script test failed: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
@@ -274,9 +288,9 @@ def run_all_tests():
         ("Configuration System", test_config_system),
         ("Unified Model Structure", test_unified_model_structure),
         ("Dummy Inference", test_dummy_inference),
-        ("Inference API", test_inference_api),
+        ("Embedding Extraction", test_embedding_extraction),
         ("Batch File Processing", test_batch_file_processing),
-        ("Command Line Interface", test_command_line_interface),
+        ("Command Line Interface", test_extraction_script),
     ]
     
     for test_name, test_func in test_cases:

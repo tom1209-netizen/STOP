@@ -377,6 +377,68 @@ class UnifiedTempMeSTOPModel(nn.Module):
         except Exception as e:
             logger.error(f"Error in retrieve_event: {e}")
             raise
+
+    def extract_video_embedding(self, video_path: str) -> torch.Tensor:
+        """
+        Extract video embedding from a video file.
+        
+        Args:
+            video_path: Path to input video file
+            
+        Returns:
+            Video embedding tensor
+        """
+        try:
+            # Step 1: Preprocess video
+            video_tensor, video_mask = self.preprocess_video(video_path)
+            
+            # Step 2: Compress frames with TempMe to get meaningful representation
+            compressed_frames, compressed_mask = self.compress_frames_with_tempme(video_tensor, video_mask)
+            
+            # Step 3: Extract visual features using STOP's visual encoder
+            if self.stop_model is not None:
+                # Use STOP's visual encoder to get video embeddings
+                video_input = compressed_frames.unsqueeze(0).unsqueeze(0)  # [1, 1, 12, C, H, W]
+                video_mask_input = compressed_mask.unsqueeze(0)            # [1, 12]
+                
+                # Move to device
+                video_input = video_input.to(self.device)
+                video_mask_input = video_mask_input.to(self.device)
+                
+                with torch.no_grad():
+                    # Get unified visual prompt (if exists)
+                    unified_visual_prompt = getattr(self.stop_model, 'unified_visual_prompt', None)
+                    
+                    # Get visual features from STOP model
+                    visual_output = self.stop_model.get_visual_output(
+                        video_input, 
+                        unified_visual_prompt,
+                        video_mask_input,
+                        video_frame=video_input.size(2)  # number of frames
+                    )
+                    
+                    # Pool the visual features to get a single video embedding
+                    # Use mean pooling over the frame dimension
+                    valid_frames = torch.sum(video_mask_input, dim=1, keepdim=True)  # [1, 1]
+                    video_embedding = torch.sum(visual_output, dim=1) / valid_frames  # [1, hidden_dim]
+                    
+                    return video_embedding.squeeze(0)  # [hidden_dim]
+            else:
+                # Fallback: use simple mean pooling over frames
+                logger.warning("STOP model not available, using simple frame averaging")
+                valid_frames = torch.sum(compressed_mask).int().item()
+                if valid_frames > 0:
+                    # Flatten spatial dimensions and average over valid frames
+                    frame_features = compressed_frames[:valid_frames].flatten(1)  # [valid_frames, C*H*W]
+                    video_embedding = torch.mean(frame_features, dim=0)  # [C*H*W]
+                    return video_embedding
+                else:
+                    # Return zero embedding if no valid frames
+                    return torch.zeros(compressed_frames.size(1) * compressed_frames.size(2) * compressed_frames.size(3))
+                    
+        except Exception as e:
+            logger.error(f"Error in extract_video_embedding: {e}")
+            raise
     
     def compute_training_loss(self, video_tensor: torch.Tensor, video_mask: torch.Tensor,
                              input_ids: torch.Tensor, attention_mask: torch.Tensor, 

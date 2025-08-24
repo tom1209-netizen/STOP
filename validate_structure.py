@@ -23,10 +23,9 @@ def test_file_structure():
     
     required_files = [
         'unified_model.py',
-        'inference.py', 
+        'extract_video_embeddings.py', 
         'config.py',
         'configs/unified_model_config.json',
-        'sample_batch.json',
         'README_unified.md'
     ]
     
@@ -82,25 +81,47 @@ def test_config_file_structure():
         return False
 
 
-def test_sample_batch_file():
-    """Test the sample batch file structure."""
+def test_extraction_script_structure():
+    """Test the extraction script functionality."""
     print("="*60)
-    print("TESTING SAMPLE BATCH FILE")
+    print("TESTING EXTRACTION SCRIPT STRUCTURE")
     print("="*60)
     
     try:
-        with open('sample_batch.json', 'r') as f:
-            batch_data = json.load(f)
+        # Check if the extraction script has the required structure
+        with open('extract_video_embeddings.py', 'r') as f:
+            script_content = f.read()
         
-        assert isinstance(batch_data, list), "Batch data should be a list"
-        print(f"✓ Batch file contains {len(batch_data)} items")
+        required_functions = [
+            'def get_video_files(',
+            'def extract_single_video_embedding(',
+            'def extract_directory_embeddings(',
+            'def save_embedding(',
+            'def main('
+        ]
         
-        for i, item in enumerate(batch_data):
-            assert 'video_path' in item, f"Item {i} missing video_path"
-            assert 'query' in item, f"Item {i} missing query"
-            print(f"✓ Item {i}: video_path='{item['video_path']}', query='{item['query']}'")
+        for func in required_functions:
+            if func in script_content:
+                print(f"✓ Function found: {func.split('(')[0]}")
+            else:
+                print(f"✗ Function missing: {func.split('(')[0]}")
+                return False
         
-        print("✓ Sample batch file structure is valid\n")
+        # Check for video extensions
+        if 'VIDEO_EXTENSIONS' in script_content:
+            print("✓ Video file extensions defined")
+        else:
+            print("✗ Video file extensions not defined")
+            return False
+        
+        # Check for argparse usage
+        if 'argparse' in script_content and 'ArgumentParser' in script_content:
+            print("✓ Command line argument parsing implemented")
+        else:
+            print("✗ Command line argument parsing missing")
+            return False
+        
+        print("✓ Extraction script structure is valid\n")
         return True
         
     except Exception as e:
@@ -116,7 +137,7 @@ def test_python_file_syntax():
     
     python_files = [
         'unified_model.py',
-        'inference.py',
+        'extract_video_embeddings.py',
         'config.py',
         'test_unified_model.py'
     ]
@@ -164,22 +185,22 @@ def test_imports_structure():
         else:
             print(f"⚠ unified_model.py missing: {import_stmt}")
     
-    # Check inference.py imports
-    with open('inference.py', 'r') as f:
-        inference_content = f.read()
+    # Check extract_video_embeddings.py imports
+    with open('extract_video_embeddings.py', 'r') as f:
+        extraction_content = f.read()
     
-    inference_imports = [
+    extraction_imports = [
         'from unified_model import',
         'import argparse',
-        'import json',
-        'from typing import List, Dict'
+        'import numpy as np',
+        'from typing import Dict, List'
     ]
     
-    for import_stmt in inference_imports:
-        if import_stmt in inference_content:
-            print(f"✓ inference.py has: {import_stmt}")
+    for import_stmt in extraction_imports:
+        if import_stmt in extraction_content:
+            print(f"✓ extract_video_embeddings.py has: {import_stmt}")
         else:
-            print(f"⚠ inference.py missing: {import_stmt}")
+            print(f"⚠ extract_video_embeddings.py missing: {import_stmt}")
     
     print("✓ Import structure checks completed\n")
     return True
@@ -191,22 +212,28 @@ def test_api_signatures():
     print("TESTING API SIGNATURES")
     print("="*60)
     
-    # Check inference.py for retrieve_event function
-    with open('inference.py', 'r') as f:
-        inference_content = f.read()
+    # Check extract_video_embeddings.py for main functions
+    with open('extract_video_embeddings.py', 'r') as f:
+        extraction_content = f.read()
     
-    # Look for the main API function signature
-    if 'def retrieve_event(video_path: str, query: str' in inference_content:
-        print("✓ retrieve_event function has correct signature")
+    # Look for the main extraction function signatures
+    if 'def extract_directory_embeddings(' in extraction_content:
+        print("✓ extract_directory_embeddings function exists")
     else:
-        print("✗ retrieve_event function signature not found or incorrect")
+        print("✗ extract_directory_embeddings function not found")
         return False
     
-    # Check for List[int] return type
-    if '-> List[int]' in inference_content:
-        print("✓ retrieve_event has correct return type annotation")
+    if 'def extract_single_video_embedding(' in extraction_content:
+        print("✓ extract_single_video_embedding function exists")
     else:
-        print("✗ retrieve_event missing return type annotation")
+        print("✗ extract_single_video_embedding function not found")
+        return False
+    
+    # Check for numpy array return type
+    if 'np.ndarray' in extraction_content:
+        print("✓ Functions use numpy arrays for embeddings")
+    else:
+        print("✗ Missing numpy array usage for embeddings")
         return False
     
     # Check unified_model.py for main class
@@ -311,7 +338,7 @@ def run_all_validation_tests():
     test_cases = [
         ("File Structure", test_file_structure),
         ("Config File Structure", test_config_file_structure),
-        ("Sample Batch File", test_sample_batch_file),
+        ("Extraction Script Structure", test_extraction_script_structure),
         ("Python File Syntax", test_python_file_syntax),
         ("Import Structure", test_imports_structure),
         ("API Signatures", test_api_signatures),
@@ -350,7 +377,7 @@ def run_all_validation_tests():
         print("\nNext steps:")
         print("1. Install PyTorch environment: conda env create -f environment.yaml")
         print("2. Download pretrained models as described in README")
-        print("3. Test with real video data: python inference.py --demo")
+        print("3. Test with real video data: python extract_video_embeddings.py --video_dir ./sample_videos --output_dir ./embeddings")
         return True
     else:
         print("⚠️  Some validation tests failed. Please check the implementation.")
