@@ -18,6 +18,19 @@ from params import get_args, save_hp_to_json
 from modules import CLIP4Clip, convert_weights
 from modules import SimpleTokenizer as ClipTokenizer
 from modules.file import PYTORCH_PRETRAINED_BERT_CACHE
+
+# Import unified model
+unified_model_available = False
+try:
+    unified_modules_path = os.path.join(os.path.dirname(__file__), 'unified_models')
+    if unified_modules_path not in sys.path:
+        sys.path.insert(0, unified_modules_path)
+    from unified_stop_tempme import UnifiedStopTempMe
+    unified_model_available = True
+    logging.info("Unified model imported successfully")
+except ImportError as e:
+    logging.warning(f"Could not import UnifiedStopTempMe: {e} - unified model not available")
+    UnifiedStopTempMe = None
 from dataloaders.data_dataloaders import DATALOADER_DICT
 from utils.lr_scheduler import lr_scheduler
 from utils.optimization import BertAdam, prep_optim_params_groups
@@ -101,10 +114,21 @@ def main_worker(gpu, ngpus_per_node, log_queue, args):
     model_state_dict = torch.load(args.init_model, map_location='cpu') if args.init_model else None
     cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed')
     
-    model = CLIP4Clip.from_pretrained(args.cross_model, 
-                                        cache_dir=cache_dir,
-                                        state_dict=model_state_dict,
-                                        task_config=args)
+    # Choose model based on model_type parameter
+    if getattr(args, 'model_type', 'stop') == 'unified' and unified_model_available and UnifiedStopTempMe is not None:
+        logging.info("Creating Unified STOP-TempMe model")
+        model = UnifiedStopTempMe.from_pretrained(args.cross_model, 
+                                            cache_dir=cache_dir,
+                                            state_dict=model_state_dict,
+                                            task_config=args)
+    else:
+        if getattr(args, 'model_type', 'stop') == 'unified':
+            logging.warning("Unified model requested but not available, falling back to STOP model")
+        logging.info("Creating STOP model (CLIP4Clip)")
+        model = CLIP4Clip.from_pretrained(args.cross_model, 
+                                            cache_dir=cache_dir,
+                                            state_dict=model_state_dict,
+                                            task_config=args)
    
     #model.freeze_cip_layers(args.freeze_layer_num)
     # Freeze backbone; keep only prompt / adapter modules trainable

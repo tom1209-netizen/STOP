@@ -151,6 +151,10 @@ def get_args(description='DGL on Retrieval Task'):
 
     parser.add_argument("--pretrained_dir", default=os.path.expanduser("~/models/pretrained"), type=str,
                             help="The pretrained directory of CLIP pretrained model")
+    
+    # Model selection
+    parser.add_argument("--model_type", default="stop", type=str, choices=["stop", "unified"],
+                            help="Choose model type: 'stop' for original STOP model, 'unified' for TempMe+STOP unified model")
 
     # arguments for distributed training
     parser.add_argument("--dist_backend", default="nccl", type=str, help="distributed backend")
