@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from params import get_args, save_hp_to_json
 from unified_model import UnifiedTempMeSTOPModel, create_unified_model
-from modules import CLIP4Clip, convert_weights
+from modules import convert_weights
 from modules import SimpleTokenizer as ClipTokenizer
 from modules.file import PYTORCH_PRETRAINED_BERT_CACHE
 from dataloaders.data_dataloaders import DATALOADER_DICT
@@ -132,31 +132,58 @@ def main_worker(gpu, ngpus_per_node, log_queue, args):
     model_state_dict = torch.load(args.init_model, map_location='cpu') if args.init_model else None
     cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed')
     
-    # Create unified model - we'll use the standard CLIP4Clip for now but adapt for unified training
-    model = CLIP4Clip.from_pretrained(args.cross_model, 
-                                        cache_dir=cache_dir,
-                                        state_dict=model_state_dict,
-                                        task_config=args)
+    # Create unified model with TempMe + STOP integration
+    from config import UnifiedModelConfig, STOPConfig, TempMeConfig
+    
+    # Build unified model configuration from args
+    stop_config = STOPConfig(
+        cross_model=args.cross_model,
+        cache_dir=cache_dir,
+        max_words=args.max_words,
+        max_frames=args.max_frames,
+        video_framerate=args.video_framerate,
+        feature_framerate=args.feature_framerate
+    )
+    
+    tempme_config = TempMeConfig()
+    
+    unified_config = UnifiedModelConfig(
+        stop=stop_config,
+        tempme=tempme_config,
+        device=f'cuda:{args.gpu}' if args.gpu is not None else 'cuda',
+        num_segments=args.max_frames * 2,  # Sample more frames for TempMe compression
+        video_size=224,
+        max_frames=args.max_frames
+    )
+    
+    # Create unified model
+    model = UnifiedTempMeSTOPModel(unified_config)
+    
+    # Load state dict if provided
+    if model_state_dict:
+        # Load STOP model state dict into the STOP component
+        if hasattr(model, 'stop_model') and model.stop_model is not None:
+            model.stop_model.load_state_dict(model_state_dict, strict=False)
    
-    # Enhanced CLIP backbone freezing with fine-grained control
-    if args.freeze_clip:
+    # Enhanced CLIP backbone freezing with fine-grained control for unified model
+    if args.freeze_clip and hasattr(model, 'stop_model') and model.stop_model is not None:
         if hasattr(args, 'freeze_substrings') and args.freeze_substrings:
-            # Fine-grained freezing via substring matching
+            # Fine-grained freezing via substring matching on STOP model
             keep_substrings = list(set(
                 (args.new_added_modules if hasattr(args, "new_added_modules") else []) +
                 (args.keep_substrings if hasattr(args, "keep_substrings") and args.keep_substrings else []) +
                 ["logit_scale"]  # keep scaling learnable
             ))
-            freeze_clip_backbone_with_substrings(model, args.freeze_substrings, keep_substrings)
+            freeze_clip_backbone_with_substrings(model.stop_model, args.freeze_substrings, keep_substrings)
         else:
-            # Standard CLIP backbone freezing
+            # Standard CLIP backbone freezing on STOP model
             keep_substrings = list(set(
                 (args.new_added_modules if hasattr(args, "new_added_modules") else []) +
                 (args.keep_substrings if hasattr(args, "keep_substrings") and args.keep_substrings else []) +
                 ["logit_scale"]  # keep scaling learnable (optional)
             ))
             frozen, kept = 0, 0
-            for name, p in model.named_parameters():
+            for name, p in model.stop_model.named_parameters():
                 if any(ks in name for ks in keep_substrings):
                     p.requires_grad = True
                     kept += p.numel()
@@ -167,7 +194,25 @@ def main_worker(gpu, ngpus_per_node, log_queue, args):
                          f"{kept} params; Frozen: {frozen} params; "
                          f"Trainable %: {kept / (kept + frozen) * 100:.2f}%")
     else:
-        logging.info("[freeze] Full model fine-tuning (freeze_clip=0)")
+        logging.info("[freeze] Full unified model fine-tuning (freeze_clip=0)")
+    
+    # Training mode configuration for unified model
+    if hasattr(args, 'training_mode'):
+        if args.training_mode == 'tempme_only':
+            # Freeze STOP, train only TempMe
+            if hasattr(model, 'freeze_stop'):
+                model.freeze_stop()
+            logging.info("Training mode: TempMe only")
+        elif args.training_mode == 'stop_only':
+            # Freeze TempMe, train only STOP
+            if hasattr(model, 'freeze_tempme'):
+                model.freeze_tempme()
+            logging.info("Training mode: STOP only")
+        else:
+            # Joint training (default)
+            if hasattr(model, 'unfreeze_all'):
+                model.unfreeze_all()
+            logging.info("Training mode: Joint TempMe + STOP")
     
     # See https://discuss.pytorch.org/t/valueerror-attemting-to-unscale-fp16-gradients/81372
     if args.precision == "amp"or args.gpu is None:  	# or args.precision == "fp32" 
@@ -411,13 +456,20 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_
         # logging.info(f"Step: {step}   video: {video}")
         # logging.info(f"Step: {step}   video_mask: {video_mask}")
 
-        # forward
+        # forward - use unified model training interface
         # with torch.cuda.amp.autocast(enabled=scaler is not None):
         with torch.amp.autocast('cuda', enabled=scaler is not None):
-            output = model(input_ids, segment_ids, input_mask, video, video_mask)
-            loss = output['loss'].mean()
-            #cluster_loss = output['cluster_loss'].mean()
-            sim_loss = output['sim_loss'].mean()
+            # Check if we have the unified model
+            if hasattr(model, 'stop_model') and model.stop_model is not None:
+                # Use STOP model component directly for compatibility with existing training loop
+                output = model.stop_model(input_ids, segment_ids, input_mask, video, video_mask)
+                loss = output['loss'].mean()
+                sim_loss = output['sim_loss'].mean()
+            else:
+                # Fallback to original interface
+                output = model(input_ids, segment_ids, input_mask, video, video_mask)
+                loss = output['loss'].mean()
+                sim_loss = output['sim_loss'].mean()
 
         if args.gradient_accumulation_steps > 1:
             loss = loss / args.gradient_accumulation_steps
@@ -444,9 +496,19 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_
 
         # CLIP-style logit_scale clamp - Note: we clamp to 4.6052 = ln(100), as in the original paper.
         if hasattr(model, 'module'):
-            torch.clamp_(model.module.clip.logit_scale.data, 0.1, 4.6052)
+            # Handle distributed training wrapper
+            actual_model = model.module
         else:
-            torch.clamp_(model.clip.logit_scale.data, 0.1, 4.6052)
+            actual_model = model
+            
+        # Update logit scale clamping for unified model
+        if hasattr(actual_model, 'stop_model') and actual_model.stop_model is not None:
+            # Unified model - clamp STOP model's logit scale
+            if hasattr(actual_model.stop_model, 'clip') and hasattr(actual_model.stop_model.clip, 'logit_scale'):
+                torch.clamp_(actual_model.stop_model.clip.logit_scale.data, 0.1, 4.6052)
+        elif hasattr(actual_model, 'clip') and hasattr(actual_model.clip, 'logit_scale'):
+            # Standard CLIP4Clip model
+            torch.clamp_(actual_model.clip.logit_scale.data, 0.1, 4.6052)
 
         batch_time = time.time() - end
         end = time.time()
@@ -455,8 +517,18 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_
             if global_step % args.n_display == 0 and is_master():
                 num_samples = (step + 1) * len(input_ids) * args.world_size
                 percent_complete = num_samples * 1.0 / samples_per_epoch * 100
-                logit_scale_data = model.module.clip.logit_scale.data if hasattr(model, 'module') \
-                                    else model.clip.logit_scale.data
+                # Get logit scale for logging from unified model
+                if hasattr(actual_model, 'stop_model') and actual_model.stop_model is not None:
+                    # Unified model - get logit scale from STOP model
+                    if hasattr(actual_model.stop_model, 'clip') and hasattr(actual_model.stop_model.clip, 'logit_scale'):
+                        logit_scale_data = actual_model.stop_model.clip.logit_scale.data
+                    else:
+                        logit_scale_data = torch.tensor(1.0)  # default fallback
+                elif hasattr(actual_model, 'clip') and hasattr(actual_model.clip, 'logit_scale'):
+                    # Standard CLIP4Clip model
+                    logit_scale_data = actual_model.clip.logit_scale.data
+                else:
+                    logit_scale_data = torch.tensor(1.0)  # default fallback
                 lr_tmp = optimizer.param_groups[0]['lr'] if args.optim == 'AdamW' else \
                             optimizer.get_lr()[0]
                 
@@ -537,7 +609,10 @@ def eval_epoch(model, test_dataloader, device, args=None, epoch=0):
             if multi_sentence_:
                 # multi-sentences retrieval means: one clip has two or more descriptions.
                 b, *_t = video.shape
-                sequence_output = model(input_ids, segment_ids, input_mask)['sequence_output']
+                if hasattr(model, 'stop_model') and model.stop_model is not None:
+                    sequence_output = model.stop_model(input_ids, segment_ids, input_mask)['sequence_output']
+                else:
+                    sequence_output = model(input_ids, segment_ids, input_mask)['sequence_output']
                 batch_sequence_output_list.append(sequence_output)
                 batch_list_t.append((input_mask, segment_ids,))
 
@@ -546,12 +621,18 @@ def eval_epoch(model, test_dataloader, device, args=None, epoch=0):
 
                 if len(filter_inds) > 0:
                     video, video_mask = video[filter_inds, ...], video_mask[filter_inds, ...]
-                    visual_output = model(video=video, video_mask=video_mask)['visual_output']
+                    if hasattr(model, 'stop_model') and model.stop_model is not None:
+                        visual_output = model.stop_model(video=video, video_mask=video_mask)['visual_output']
+                    else:
+                        visual_output = model(video=video, video_mask=video_mask)['visual_output']
                     batch_visual_output_list.append(visual_output)
                     batch_list_v.append((video_mask,))
                 total_video_num += b
             else:
-                output = model(input_ids, segment_ids, input_mask, video, video_mask)
+                if hasattr(model, 'stop_model') and model.stop_model is not None:
+                    output = model.stop_model(input_ids, segment_ids, input_mask, video, video_mask)
+                else:
+                    output = model(input_ids, segment_ids, input_mask, video, video_mask)
                 batch_sequence_output_list.append(output['sequence_output'])
                 batch_list_t.append((input_mask, segment_ids,))
 
