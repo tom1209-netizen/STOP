@@ -227,6 +227,16 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                                                     video_frames=self.video_frames,
                                                     args=task_config)
 
+        # Initialize TempMe compression module
+        self.use_tempme = getattr(task_config, "use_tempme", False)
+        if self.use_tempme:
+            from .tempme import get_tempme_model
+            self.tempme_compressor = get_tempme_model(task_config)
+            log_info("\n TempMe Configuration:\n"
+                        "\t TempMe enabled: {}\n"
+                        "\t TempMe type: {}\n".format(self.use_tempme, 
+                                                      getattr(task_config, 'tempme_type', 'basic')))
+
         cross_config.max_position_embeddings = clip_config['context_length']
 
         if self.loose_type is False:
@@ -398,10 +408,38 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         return tFeature
 
     def get_visual_output(self,video,unified_visual_prompt,video_mask=None, video_frame=-1):
-        """image encoding"""
+        """image encoding with optional TempMe compression"""
         bs_pair = video_mask.size(0)
         
         batch_size, pair, video_frame, channel, h, w = video.shape
+        
+        # Apply TempMe compression if enabled
+        if self.use_tempme and hasattr(self, 'tempme_compressor'):
+            try:
+                # Reshape for TempMe processing: [B*pair, T, C, H, W]
+                video_for_tempme = video.view(batch_size * pair, video_frame, channel, h, w)
+                
+                # Apply TempMe compression 
+                compressed_video = self.tempme_compressor(video_for_tempme)
+                
+                # Update video_frame to compressed frame count
+                new_video_frame = compressed_video.size(1)
+                
+                # Reshape back to original format
+                video = compressed_video.view(batch_size, pair, new_video_frame, channel, h, w)
+                video_frame = new_video_frame
+                
+                # Update video_mask to match compressed frames
+                if video_mask.size(-1) != video_frame:
+                    # Create new mask for compressed frames  
+                    new_mask = torch.ones(bs_pair, video_frame, dtype=video_mask.dtype, device=video_mask.device)
+                    video_mask = new_mask
+                    
+            except Exception as e:
+                # If TempMe fails, continue with original video
+                import logging
+                logging.warning(f"TempMe compression failed: {e}, continuing with original frames")
+        
         video = video.view(-1, channel, h, w)
         visual_hidden = self.clip.encode_image(video,unified_visual_prompt,video_frame=video_frame)
         

@@ -221,6 +221,36 @@ def get_args(description='DGL on Retrieval Task'):
     
     parser.add_argument('--temporal_prompt', type=str, default="DGL")
     
+    # TempMe configuration parameters
+    parser.add_argument('--use_tempme', type=bool, default=False,
+                            help="Whether to use TempMe temporal compression")
+    parser.add_argument('--tempme_type', type=str, default='simple', choices=['simple', 'basic', 'adaptive'],
+                            help="Type of TempMe model to use")
+    parser.add_argument('--tempme_compression_ratio', type=float, default=0.75,
+                            help="Compression ratio for simple TempMe (0.0-1.0)")
+    parser.add_argument('--tempme_input_frames', type=int, default=32,
+                            help="Number of dense input frames for TempMe")
+    parser.add_argument('--tempme_output_frames', type=int, default=12,
+                            help="Number of compressed output frames from TempMe")
+    parser.add_argument('--tempme_frame_dim', type=int, default=768,
+                            help="Frame feature dimension for TempMe")
+    parser.add_argument('--tempme_hidden_dim', type=int, default=512,
+                            help="Hidden dimension for TempMe compression")
+    parser.add_argument('--tempme_num_layers', type=int, default=3,
+                            help="Number of transformer layers in TempMe")
+    parser.add_argument('--tempme_num_heads', type=int, default=8,
+                            help="Number of attention heads in TempMe")
+    parser.add_argument('--tempme_max_input_frames', type=int, default=64,
+                            help="Maximum input frames for adaptive TempMe")
+    parser.add_argument('--tempme_min_output_frames', type=int, default=8,
+                            help="Minimum output frames for adaptive TempMe")
+    parser.add_argument('--tempme_max_output_frames', type=int, default=16,
+                            help="Maximum output frames for adaptive TempMe")
+    parser.add_argument('--tempme_frame_channels', type=int, default=3,
+                            help="Number of channels in video frames")
+    parser.add_argument('--tempme_frame_size', type=int, default=224,
+                            help="Frame size for TempMe processing")
+    
     
     args = parser.parse_args()
 
@@ -258,6 +288,11 @@ def get_args(description='DGL on Retrieval Task'):
         args.new_added_modules = ['visual_prompt_embedding','prompt_embeddings','prefix_text_prompt_proj_layer','postfix_text_prompt_proj_layer']
     
     args.new_added_modules += ["visual.TemporalPrompt"]
+    
+    # Add TempMe modules if enabled
+    if args.use_tempme:
+        args.new_added_modules += ["tempme_compressor"]
+    
     if args.lora:
         args.new_added_modules += ["LoRA"]
 

@@ -17,10 +17,12 @@ from .transforms import TensorNormalize, TensorMultiScaleCrop, GroupToTensorBCHW
 
 class RawVideoExtractorpyAV():
     def __init__(self, centercrop=False, size=224, is_train=True, num_segments=12,
-                    lmdb_dataset=None):
+                    lmdb_dataset=None, use_tempme=False, tempme_dense_frames=32):
         """
         Args:
             lmdb_dataset: if not None, use lmdb dataset
+            use_tempme: if True, sample dense frames for TempMe compression
+            tempme_dense_frames: number of dense frames to sample for TempMe
         """
         self.centercrop = centercrop
         self.size = size
@@ -28,6 +30,8 @@ class RawVideoExtractorpyAV():
         self.train = is_train
         self.num_segments = num_segments
         self.lmdb_dataset = lmdb_dataset
+        self.use_tempme = use_tempme
+        self.tempme_dense_frames = tempme_dense_frames
 
     def _train_transform(self, n_px):
         return Compose([
@@ -83,10 +87,18 @@ class RawVideoExtractorpyAV():
         num_frames = min(num_frames, len(all_frames))
 
         # frames sampling
-        if self.train:
-            inds = multi_segments_sampling(self.num_segments, num_frames, random_shift=random_shift)
+        if self.use_tempme:
+            # Dense sampling for TempMe compression
+            if self.train:
+                inds = multi_segments_sampling(self.tempme_dense_frames, num_frames, random_shift=random_shift)
+            else:
+                inds = uniform_sampling(self.tempme_dense_frames, num_frames, twice_sample=False)
         else:
-            inds = uniform_sampling(self.num_segments, num_frames, twice_sample=False)
+            # Standard sampling for STOP
+            if self.train:
+                inds = multi_segments_sampling(self.num_segments, num_frames, random_shift=random_shift)
+            else:
+                inds = uniform_sampling(self.num_segments, num_frames, twice_sample=False)
 
         # av.Frames --> np.ndarray of shape [H, W, C]
         try:
@@ -100,7 +112,10 @@ class RawVideoExtractorpyAV():
         # tensor of shape [T, C, H, W]
         video_tensor = self.transform(sampled_frames)
 
-        frame_length = min(num_frames, self.num_segments)
+        if self.use_tempme:
+            frame_length = min(num_frames, self.tempme_dense_frames)
+        else:
+            frame_length = min(num_frames, self.num_segments)
         # return a video tensor, the real sampled frame for video mask
         return video_tensor, frame_length
 
