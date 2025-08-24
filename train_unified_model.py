@@ -1,480 +1,651 @@
-#!/usr/bin/env python3
-"""
-Training script for the Unified TempMe-STOP Model
-
-This script provides comprehensive training capabilities for the unified model with multiple training strategies:
-- Joint training (both modules together)
-- Individual module training (TempMe only or STOP only)
-- Sequential training (TempMe first, then STOP)
-
-Usage:
-    # Joint training (recommended)
-    python train_unified_model.py --config configs/training_config.json --mode joint
-    
-    # Train only TempMe module
-    python train_unified_model.py --config configs/training_config.json --mode tempme_only
-    
-    # Train only STOP module
-    python train_unified_model.py --config configs/training_config.json --mode stop_only
-    
-    # Sequential training
-    python train_unified_model.py --config configs/training_config.json --mode sequential
-"""
+# coding=utf-8
+from __future__ import (absolute_import, division, unicode_literals)
 
 import os
 import sys
 import time
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 import logging
-import argparse
-import json
-from tqdm import tqdm
-from pathlib import Path
+import numpy as np
+import torch.nn.functional as F
+import torch.multiprocessing as mp
+from torch import optim, distributed
+# from torch.cuda.amp import GradScaler
+from torch.amp import GradScaler
+from torch.utils.tensorboard import SummaryWriter
 
-# Add project root to path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
+from params import get_args, save_hp_to_json
 from unified_model import UnifiedTempMeSTOPModel, create_unified_model
-from config import UnifiedModelConfig, UnifiedTrainingConfig
+from modules import CLIP4Clip, convert_weights
+from modules import SimpleTokenizer as ClipTokenizer
+from modules.file import PYTORCH_PRETRAINED_BERT_CACHE
 from dataloaders.data_dataloaders import DATALOADER_DICT
+from utils.lr_scheduler import lr_scheduler
+from utils.optimization import BertAdam, prep_optim_params_groups
+from utils.log import setup_primary_logging, setup_worker_logging
+from utils.misc import set_random_seed, convert_models_to_fp32, save_checkpoint
+from utils.dist_utils import is_master, get_rank, is_dist_avail_and_initialized, init_distributed_mode
+from utils.metrics import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim
 
-# Import modules needed for training
-try:
-    from stop_modules.simple_tokenizer import SimpleTokenizer as ClipTokenizer
-except ImportError:
-    try:
-        from modules.simple_tokenizer import SimpleTokenizer as ClipTokenizer
-    except ImportError:
-        ClipTokenizer = None
-        
-try:
-    from utils.optimization import BertAdam
-except ImportError:
-    BertAdam = None
-    
-try:
-    from utils.lr_scheduler import lr_scheduler
-except ImportError:
-    lr_scheduler = None
-    
-try:
-    from utils.misc import set_random_seed, save_checkpoint
-except ImportError:
-    def set_random_seed(seed):
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-    save_checkpoint = None
-    
-try:
-    from utils.metrics import compute_metrics
-except ImportError:
-    compute_metrics = None
+best_R1 = 0
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+def print_trainable_params(model):
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total params: {total_params}, Trainable: {trainable_params} ({trainable_params / total_params * 100:.2f}%)")
 
+def freeze_clip_backbone_with_substrings(model, freeze_substrings=None, keep_substrings=None):
+    """
+    Fine-grained freezing via name substring matching.
+    Args:
+        model: The model to freeze parameters in
+        freeze_substrings: List of substrings - parameters containing these will be frozen
+        keep_substrings: List of substrings - parameters containing these will remain trainable
+    """
+    if freeze_substrings is None:
+        freeze_substrings = []
+    if keep_substrings is None:
+        keep_substrings = ["logit_scale"]  # Always keep logit_scale trainable
+    
+    frozen, kept = 0, 0
+    for name, p in model.named_parameters():
+        should_freeze = any(fs in name for fs in freeze_substrings)
+        should_keep = any(ks in name for ks in keep_substrings)
+        
+        if should_keep:
+            p.requires_grad = True
+            kept += p.numel()
+        elif should_freeze:
+            p.requires_grad = False
+            frozen += p.numel()
+        # If neither, maintain current state
+        
+    logging.info(f"[freeze] Fine-grained freezing applied. "
+                f"Frozen: {frozen} params; Kept trainable: {kept} params")
+    return frozen, kept
 
-class UnifiedModelTrainer:
-    """Trainer class for the unified TempMe-STOP model."""
-    
-    def __init__(self, config: UnifiedModelConfig):
-        self.config = config
-        self.training_config = config.training
-        self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-        
-        # Initialize model
-        self.model = UnifiedTempMeSTOPModel(config)
-        self.model.to(self.device)
-        
-        # Initialize tokenizer
-        try:
-            self.tokenizer = ClipTokenizer()
-        except:
-            logger.warning("ClipTokenizer not available, using dummy tokenizer")
-            self.tokenizer = None
-        
-        # Training components
-        self.optimizer = None
-        self.scheduler = None
-        self.scaler = torch.cuda.amp.GradScaler() if config.device == "cuda" else None
-        
-        # Tracking
-        self.current_epoch = 0
-        self.global_step = 0
-        self.best_metric = 0.0
-        
-        # Setup directories
-        self.setup_directories()
-        
-        # Setup tensorboard
-        self.writer = SummaryWriter(os.path.join(self.training_config.checkpoint_dir, "logs"))
-        
-    def setup_directories(self):
-        """Create necessary directories for training."""
-        os.makedirs(self.training_config.checkpoint_dir, exist_ok=True)
-        os.makedirs(os.path.join(self.training_config.checkpoint_dir, "logs"), exist_ok=True)
-        
-    def setup_dataloaders(self):
-        """Setup training and validation dataloaders."""
-        if not self.tokenizer:
-            logger.error("Tokenizer not available, cannot setup dataloaders")
-            return None, None
-            
-        # Mock args for compatibility with existing dataloaders
-        class MockArgs:
-            def __init__(self, config):
-                self.datatype = config.training.datatype
-                self.batch_size = config.training.batch_size
-                self.batch_size_val = config.training.batch_size
-                self.data_dir = config.training.train_data_path
-                self.val_csv = config.training.val_data_path
-                self.num_thread_reader = 4
-                self.max_words = 77
-                self.max_frames = config.max_frames
-                self.video_size = config.video_size
-                self.feature_framerate = 1
-                # Add other required attributes as needed
-                
-        mock_args = MockArgs(self.config)
-        
-        try:
-            # Get appropriate dataloader
-            if self.training_config.datatype in DATALOADER_DICT:
-                train_dataloader, train_length, train_sampler = DATALOADER_DICT[self.training_config.datatype]["train"](
-                    mock_args, self.tokenizer
-                )
-                val_dataloader, val_length = DATALOADER_DICT[self.training_config.datatype]["val"](
-                    mock_args, self.tokenizer, subset="val"
-                )
-                
-                logger.info(f"Loaded {train_length} training samples and {val_length} validation samples")
-                return train_dataloader, val_dataloader
-            else:
-                logger.error(f"Datatype {self.training_config.datatype} not supported")
-                return None, None
-                
-        except Exception as e:
-            logger.error(f"Error setting up dataloaders: {e}")
-            return None, None
-    
-    def setup_optimizer_and_scheduler(self):
-        """Setup optimizer and learning rate scheduler."""
-        training_mode = self.training_config.training_mode
-        
-        # Setup model parameters based on training mode
-        if training_mode == "joint":
-            self.model.unfreeze_all()
-            param_groups = self.model.get_parameter_groups(
-                self.training_config.tempme_lr,
-                self.training_config.stop_lr
-            )
-        elif training_mode == "tempme_only":
-            self.model.freeze_stop()
-            param_groups = [{'params': self.model.get_trainable_parameters(), 'lr': self.training_config.tempme_lr}]
-        elif training_mode == "stop_only":
-            self.model.freeze_tempme()
-            param_groups = [{'params': self.model.get_trainable_parameters(), 'lr': self.training_config.stop_lr}]
-        else:
-            raise ValueError(f"Unknown training mode: {training_mode}")
-        
-        # Setup optimizer
-        if self.training_config.optimizer == "AdamW":
-            self.optimizer = optim.AdamW(
-                param_groups,
-                weight_decay=self.training_config.weight_decay
-            )
-        elif self.training_config.optimizer == "BertAdam":
-            # Flatten parameter groups for BertAdam
-            all_params = []
-            for group in param_groups:
-                all_params.extend(group['params'])
-            
-            self.optimizer = BertAdam(
-                all_params,
-                lr=self.training_config.stop_lr,  # Use STOP lr as default
-                warmup=self.training_config.warmup_epochs / self.training_config.num_epochs,
-                schedule='warmup_cosine',
-                weight_decay=self.training_config.weight_decay,
-                max_grad_norm=self.training_config.max_grad_norm
-            )
-        else:
-            raise ValueError(f"Unknown optimizer: {self.training_config.optimizer}")
-        
-        # Setup scheduler
-        if self.training_config.scheduler == "cosine" and self.training_config.optimizer == "AdamW":
-            total_steps = self.training_config.num_epochs  # Simplified for now
-            warmup_steps = int(self.training_config.warmup_epochs)
-            
-            self.scheduler = lr_scheduler(
-                mode='cos',
-                init_lr=self.training_config.stop_lr,
-                all_iters=total_steps,
-                slow_start_iters=warmup_steps,
-                weight_decay=self.training_config.weight_decay
-            )
-        
-        logger.info(f"Setup optimizer: {self.training_config.optimizer}")
-        logger.info(f"Training mode: {training_mode}")
-        
-        # Log trainable parameters
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        logger.info(f"Total params: {total_params:,}, Trainable: {trainable_params:,} "
-                   f"({trainable_params/total_params*100:.2f}%)")
-    
-    def train_epoch(self, train_dataloader):
-        """Train for one epoch."""
-        self.model.train()
-        total_loss = 0.0
-        num_batches = len(train_dataloader)
-        
-        progress_bar = tqdm(train_dataloader, desc=f"Epoch {self.current_epoch+1}")
-        
-        for batch_idx, batch in enumerate(progress_bar):
-            # Move batch to device
-            if torch.cuda.is_available():
-                batch = tuple(t.to(self.device) for t in batch)
-            
-            input_ids, input_mask, segment_ids, video, video_mask = batch
-            
-            # Forward pass
-            self.optimizer.zero_grad()
-            
-            with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-                # Compute training loss
-                loss_dict = self.model.compute_training_loss(
-                    video, video_mask, input_ids, input_mask, segment_ids
-                )
-                
-                total_loss_batch = loss_dict['total_loss']
-                
-                # Scale loss for gradient accumulation
-                if self.training_config.gradient_accumulation_steps > 1:
-                    total_loss_batch = total_loss_batch / self.training_config.gradient_accumulation_steps
-            
-            # Backward pass
-            if self.scaler is not None:
-                self.scaler.scale(total_loss_batch).backward()
-                
-                if (batch_idx + 1) % self.training_config.gradient_accumulation_steps == 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.training_config.max_grad_norm)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    
-                    if self.scheduler:
-                        self.scheduler(self.optimizer, global_step=self.global_step)
-                    
-                    self.global_step += 1
-            else:
-                total_loss_batch.backward()
-                
-                if (batch_idx + 1) % self.training_config.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.training_config.max_grad_norm)
-                    self.optimizer.step()
-                    
-                    if self.scheduler:
-                        self.scheduler(self.optimizer, global_step=self.global_step)
-                    
-                    self.global_step += 1
-            
-            # Update progress
-            total_loss += total_loss_batch.item()
-            progress_bar.set_postfix({
-                'loss': f"{total_loss_batch.item():.4f}",
-                'avg_loss': f"{total_loss/(batch_idx+1):.4f}"
-            })
-            
-            # Log to tensorboard
-            if self.global_step % 10 == 0:
-                self.writer.add_scalar('Train/Loss', total_loss_batch.item(), self.global_step)
-                for key, value in loss_dict.items():
-                    if key != 'total_loss' and torch.is_tensor(value):
-                        self.writer.add_scalar(f'Train/{key}', value.item(), self.global_step)
-        
-        avg_loss = total_loss / num_batches
-        logger.info(f"Epoch {self.current_epoch+1} - Average training loss: {avg_loss:.4f}")
-        
-        return avg_loss
-    
-    def evaluate(self, val_dataloader):
-        """Evaluate the model."""
-        self.model.eval()
-        total_loss = 0.0
-        num_batches = len(val_dataloader)
-        
-        with torch.no_grad():
-            for batch in tqdm(val_dataloader, desc="Evaluating"):
-                if torch.cuda.is_available():
-                    batch = tuple(t.to(self.device) for t in batch)
-                
-                input_ids, input_mask, segment_ids, video, video_mask = batch
-                
-                # Compute validation loss
-                loss_dict = self.model.compute_training_loss(
-                    video, video_mask, input_ids, input_mask, segment_ids
-                )
-                
-                total_loss += loss_dict['total_loss'].item()
-        
-        avg_loss = total_loss / num_batches
-        logger.info(f"Validation loss: {avg_loss:.4f}")
-        
-        # Log to tensorboard
-        self.writer.add_scalar('Val/Loss', avg_loss, self.current_epoch)
-        
-        return avg_loss
-    
-    def save_checkpoint(self, is_best=False):
-        """Save model checkpoint."""
-        checkpoint = {
-            'epoch': self.current_epoch,
-            'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'best_metric': self.best_metric,
-            'config': self.config.__dict__
-        }
-        
-        if self.scaler:
-            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
-        
-        # Save regular checkpoint
-        checkpoint_path = os.path.join(self.training_config.checkpoint_dir, f"checkpoint_epoch_{self.current_epoch}.pth")
-        torch.save(checkpoint, checkpoint_path)
-        
-        # Save best checkpoint
-        if is_best:
-            best_path = os.path.join(self.training_config.checkpoint_dir, "best_model.pth")
-            torch.save(checkpoint, best_path)
-            logger.info(f"Saved best model checkpoint: {best_path}")
-        
-        logger.info(f"Saved checkpoint: {checkpoint_path}")
-    
-    def load_checkpoint(self, checkpoint_path):
-        """Load model checkpoint."""
-        if not os.path.exists(checkpoint_path):
-            logger.warning(f"Checkpoint not found: {checkpoint_path}")
-            return False
-        
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.current_epoch = checkpoint['epoch']
-        self.global_step = checkpoint['global_step']
-        self.best_metric = checkpoint['best_metric']
-        
-        if self.scaler and 'scaler_state_dict' in checkpoint:
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        
-        logger.info(f"Loaded checkpoint from epoch {self.current_epoch}")
-        return True
-    
-    def train(self, resume_from=None):
-        """Main training loop."""
-        logger.info("Starting unified model training...")
-        
-        # Setup training components
-        train_dataloader, val_dataloader = self.setup_dataloaders()
-        if train_dataloader is None:
-            logger.error("Failed to setup dataloaders")
-            return
-            
-        self.setup_optimizer_and_scheduler()
-        
-        # Resume from checkpoint if specified
-        if resume_from:
-            self.load_checkpoint(resume_from)
-            start_epoch = self.current_epoch + 1
-        else:
-            start_epoch = 0
-        
-        # Training loop
-        for epoch in range(start_epoch, self.training_config.num_epochs):
-            self.current_epoch = epoch
-            
-            # Train for one epoch
-            train_loss = self.train_epoch(train_dataloader)
-            
-            # Evaluate
-            if epoch % self.training_config.eval_every_n_epochs == 0:
-                val_loss = self.evaluate(val_dataloader)
-                
-                # Check if best model (using validation loss as metric)
-                current_metric = -val_loss  # Negative because lower loss is better
-                is_best = current_metric > self.best_metric
-                if is_best:
-                    self.best_metric = current_metric
-                
-                # Save checkpoint
-                if epoch % self.training_config.save_every_n_epochs == 0:
-                    self.save_checkpoint(is_best=is_best)
-        
-        # Final save
-        self.save_checkpoint(is_best=False)
-        self.writer.close()
-        
-        logger.info("Training completed!")
+def main(args):
+    """main function"""
 
-
-def main():
-    parser = argparse.ArgumentParser(description="Train Unified TempMe-STOP Model")
-    parser.add_argument("--config", type=str, required=True, 
-                       help="Path to training configuration file")
-    parser.add_argument("--mode", type=str, default="joint",
-                       choices=["joint", "tempme_only", "stop_only", "sequential"],
-                       help="Training mode")
-    parser.add_argument("--resume", type=str, default=None,
-                       help="Path to checkpoint to resume from")
-    parser.add_argument("--seed", type=int, default=42,
-                       help="Random seed")
-    
-    args = parser.parse_args()
-    
-    # Set random seed
     set_random_seed(args.seed)
-    
-    # Load configuration
-    if os.path.exists(args.config):
-        config = UnifiedModelConfig.from_json(args.config)
+
+    # Set multiprocessing type to spawn.
+    if not args.remote:
+        torch.multiprocessing.set_start_method('spawn')
+
+    # Set logger
+    log_queue = setup_primary_logging(os.path.join(args.output_dir, "log.txt"), args.log_level, args.remote)
+
+    # lmdb
+    if args.lmdb_dataset not in [None, 'None']:
+        assert os.path.exists(args.lmdb_dataset)
+        print('INFO: [dataset] Using {} as data source'.format(args.lmdb_dataset))
+
+    # the number of gpus
+    args.ngpus_per_node = torch.cuda.device_count()
+    print("INFO: [CUDA] The number of GPUs in this node is {}".format(args.ngpus_per_node))
+
+    # Distributed training = training on more than one GPU.
+    # Also easily possible to extend to multiple nodes & multiple GPUs.
+    args.distributed = (args.gpu is None) and torch.cuda.is_available() and (not args.dp)
+    if args.distributed:
+        if args.remote:
+            raise NotImplementedError
+        else:
+            # Since we have ngpus_per_node processes per node, the total world_size
+            # needs to be adjusted accordingly
+            args.world_size = args.ngpus_per_node * args.world_size
+        mp.spawn(main_worker, nprocs=args.ngpus_per_node, args=(args.ngpus_per_node, log_queue, args))
     else:
-        logger.error(f"Configuration file not found: {args.config}")
-        return
+        # nn.DataParallel (DP)
+        if args.dp:
+            args.gpu, args.world_size = args.multigpu[0], len(args.multigpu)
+        else:
+            args.world_size = 1
+        main_worker(args.gpu, None, log_queue, args)
+
+
+def main_worker(gpu, ngpus_per_node, log_queue, args):
+    """main worker"""
+    global best_R1
+    args.gpu = gpu
+
+
+    ## ####################################
+    # initilization
+    ## ####################################
+    global_rank = init_distributed_mode(args, ngpus_per_node, gpu)
+    setup_worker_logging(global_rank, log_queue, args.log_level)
+    # Lock the random seed of the model to ensure that the model initialization of each process is the same.
+    set_random_seed(args.seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    # save parameters
+    if is_master(): save_hp_to_json(args.output_dir, args)
+
+
+    ## ####################################
+    # create unified model
+    ## ####################################
+    # create tokenizer
+    tokenizer = ClipTokenizer()
+    model_state_dict = torch.load(args.init_model, map_location='cpu') if args.init_model else None
+    cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE), 'distributed')
     
-    # Override training mode if specified
-    config.training.training_mode = args.mode
-    
-    # Create trainer and start training
-    trainer = UnifiedModelTrainer(config)
-    
-    if args.mode == "sequential":
-        # Sequential training: TempMe first, then STOP
-        logger.info("Starting sequential training...")
-        
-        # Phase 1: Train TempMe only
-        logger.info("Phase 1: Training TempMe module...")
-        config.training.training_mode = "tempme_only"
-        config.training.num_epochs = config.training.num_epochs // 2
-        trainer_tempme = UnifiedModelTrainer(config)
-        trainer_tempme.train(args.resume)
-        
-        # Phase 2: Train STOP only (load TempMe weights)
-        logger.info("Phase 2: Training STOP module...")
-        tempme_checkpoint = os.path.join(config.training.checkpoint_dir, "best_model.pth")
-        config.training.training_mode = "stop_only"
-        trainer_stop = UnifiedModelTrainer(config)
-        trainer_stop.train(tempme_checkpoint)
+    # Create unified model - we'll use the standard CLIP4Clip for now but adapt for unified training
+    model = CLIP4Clip.from_pretrained(args.cross_model, 
+                                        cache_dir=cache_dir,
+                                        state_dict=model_state_dict,
+                                        task_config=args)
+   
+    # Enhanced CLIP backbone freezing with fine-grained control
+    if args.freeze_clip:
+        if hasattr(args, 'freeze_substrings') and args.freeze_substrings:
+            # Fine-grained freezing via substring matching
+            keep_substrings = list(set(
+                (args.new_added_modules if hasattr(args, "new_added_modules") else []) +
+                (args.keep_substrings if hasattr(args, "keep_substrings") and args.keep_substrings else []) +
+                ["logit_scale"]  # keep scaling learnable
+            ))
+            freeze_clip_backbone_with_substrings(model, args.freeze_substrings, keep_substrings)
+        else:
+            # Standard CLIP backbone freezing
+            keep_substrings = list(set(
+                (args.new_added_modules if hasattr(args, "new_added_modules") else []) +
+                (args.keep_substrings if hasattr(args, "keep_substrings") and args.keep_substrings else []) +
+                ["logit_scale"]  # keep scaling learnable (optional)
+            ))
+            frozen, kept = 0, 0
+            for name, p in model.named_parameters():
+                if any(ks in name for ks in keep_substrings):
+                    p.requires_grad = True
+                    kept += p.numel()
+                else:
+                    p.requires_grad = False
+                    frozen += p.numel()
+            logging.info(f"[freeze] Keeping trainable (matched substrings {keep_substrings}): "
+                         f"{kept} params; Frozen: {frozen} params; "
+                         f"Trainable %: {kept / (kept + frozen) * 100:.2f}%")
     else:
-        # Standard training
-        trainer.train(args.resume)
+        logging.info("[freeze] Full model fine-tuning (freeze_clip=0)")
+    
+    # See https://discuss.pytorch.org/t/valueerror-attemting-to-unscale-fp16-gradients/81372
+    if args.precision == "amp"or args.gpu is None:  	# or args.precision == "fp32" 
+        logging.info("[weight convert] ==>> Convert weights to fp32 for {}...".format(args.precision))
+        convert_models_to_fp32(model)
+        logging.info("[weight convert] ==>> Convert done!")
+
+    if not torch.cuda.is_available():
+        model.float()
+        logging.warning("using CPU, this will be slow")
+    else:
+        model.cuda(args.gpu)
+        if args.precision == "fp16":
+            convert_weights(model)
+        # Previously batch size and workers were global and not per GPU.
+        # args.batch_size = args.batch_size / ngpus_per_node)
+        # args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
+        if args.distributed and args.use_bn_sync:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        if args.distributed:
+            if args.freeze_clip:
+                if is_master():
+                    kept_names = [n for n,p in model.named_parameters() if p.requires_grad]
+                    logging.info("[freeze] Trainable parameter names (first 50): "
+                                + ", ".join(kept_names[:50]))
+                    logging.info(f"[freeze] Total kept: {len(kept_names)}")
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu],
+                                                                find_unused_parameters=True if args.freeze_clip else True)
+        if args.dp:
+            model = torch.nn.DataParallel(model, device_ids=args.multigpu)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu", get_rank() % ngpus_per_node)
+
+
+    ## ####################################
+    # dataloader loading
+    ## ####################################
+    assert args.datatype in DATALOADER_DICT
+    assert DATALOADER_DICT[args.datatype]["test"] is not None \
+           or DATALOADER_DICT[args.datatype]["val"] is not None
+
+    test_dataloader, test_length = None, 0
+    if DATALOADER_DICT[args.datatype]["test"] is not None:
+        test_dataloader, test_length = DATALOADER_DICT[args.datatype]["test"](args, tokenizer)
+
+    if DATALOADER_DICT[args.datatype]["val"] is not None:
+        val_dataloader, val_length = DATALOADER_DICT[args.datatype]["val"](args, tokenizer, subset="val")
+    else:
+        val_dataloader, val_length = test_dataloader, test_length
+
+    ## report validation results if the ["test"] is None
+    if test_dataloader is None:
+        test_dataloader, test_length = val_dataloader, val_length
+
+    train_dataloader, train_length, train_sampler = DATALOADER_DICT[args.datatype]["train"](args, tokenizer)
+    num_train_optimization_steps = (int(len(train_dataloader) + args.gradient_accumulation_steps - 1)
+                                    / args.gradient_accumulation_steps) * args.epochs
+
+
+    ## ####################################
+    # optimization strategies
+    ## ####################################
+    optimizer_grouped_parameters = prep_optim_params_groups(args, model, coef_lr=args.coef_lr)
+    scaler = GradScaler() if args.precision == "amp" else None
+    if args.optim == 'BertAdam':
+        logging.info('[optimizer] Using BertAdam Optimizer...')
+        optimizer = BertAdam(optimizer_grouped_parameters, lr=args.lr, warmup=args.warmup_proportion,
+                                schedule='warmup_cosine', b1=0.9, b2=0.98, e=1e-6,
+                                t_total=num_train_optimization_steps, weight_decay=args.wd,
+                                max_grad_norm=1.0)
+        scheduler = None
+    elif args.optim == 'AdamW':
+        logging.info('[optimizer] Using AdamW Optimizer...')
+        optimizer = optim.AdamW(optimizer_grouped_parameters, lr=args.lr,
+                                betas=(args.beta1, args.beta2), eps=args.eps, weight_decay=args.wd)
+        scheduler = lr_scheduler(mode='cos', init_lr=args.lr, all_iters=num_train_optimization_steps,
+                                    slow_start_iters=args.warmup_proportion * num_train_optimization_steps,
+                                    weight_decay=args.wd
+                                )
+    else:
+        raise NotImplementedError
+
+    if is_master():
+        tf_writer = SummaryWriter(args.tensorboard_path)
+    else:
+        tf_writer = None
+
+    ## ####################################
+    #  optionally resume from a checkpoint
+    ## ####################################
+    start_epoch, global_step = 0, 0
+    if args.resume is not None:
+        if os.path.isfile(args.resume):
+            if args.gpu is None:
+                checkpoint = torch.load(args.resume)
+            else:
+                # Map model to be loaded to specified single gpu.
+                loc = "cuda:{}".format(args.gpu)
+                checkpoint = torch.load(args.resume, map_location=loc)
+            
+            sd = checkpoint["state_dict"]
+            if not args.distributed and next(iter(sd.items()))[0].startswith('module'):
+                sd = {k[len('module.'):]: v for k, v in sd.items()}
+            model.load_state_dict(sd)
+
+            if not args.load_from_pretrained:
+                if "optimizer" in checkpoint and optimizer is not None:
+                    optimizer.load_state_dict(checkpoint["optimizer"])
+                if "scaler" in checkpoint and scaler is not None:
+                    logging.info("[resume] => Loading state_dict of AMP loss scaler")
+                    scaler.load_state_dict(checkpoint['scaler'])
+                start_epoch, global_step = checkpoint["epoch"], checkpoint["global_step"]
+
+            logging.info(f"[resume] => loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']})\n")
+        else:
+            logging.info("[resume] => no checkpoint found at '{}'\n".format(args.resume))
+
+
+    print_trainable_params(model)
+
+
+    ## ####################################
+    # train and evalution
+    ## ####################################
+    if is_master():
+        logging.info("\n======================== Running training ========================")
+        logging.info("  Num examples = %d", train_length)
+        logging.info("  Batch size = %d", args.batch_size)
+        logging.info("  Num steps = %d", num_train_optimization_steps * args.gradient_accumulation_steps)
+        logging.info("\n======================== Running test ========================")
+        logging.info("  Num examples = %d", test_length)
+        logging.info("  Batch size = %d", args.batch_size_val)
+        logging.info("  Num steps = %d", len(test_dataloader))
+        logging.info("\n======================== Running val ========================")
+        logging.info("  Num examples = %d", val_length)
+
+    all_start = time.time()
+
+    if args.do_eval and is_master():
+        R1, infer_epoch_time, info_str = eval_epoch(model, test_dataloader, device, args=args)
+        torch.cuda.synchronize()
+        all_time = time.time() - all_start
+        logging.info('The total running time of the program is {:.2f} Seconds\n'.format(all_time))
+        logging.info('The maximum GPU memory occupied by this program is {:.2f} GB\n'.format(
+                        torch.cuda.max_memory_allocated(0) * 1.0 / 1024 / 1024 / 1024))
+        sys.exit(0)
+
+    eval_infer_times = []
+    best_e = 0
+    best_info = []
+    for epoch in range(start_epoch, args.epochs):
+        if is_dist_avail_and_initialized():
+            train_sampler.set_epoch(epoch)
+        # set_random_seed(epoch + args.seed)
+
+        tr_loss, global_step = train_epoch(epoch, args, model, train_dataloader, device, optimizer,
+                                            global_step, scaler=scaler, tf_writer=tf_writer, scheduler=scheduler)
+
+        if is_master():
+            logging.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
+
+            # Run on val dataset, this process is *TIME-consuming*.
+            R1, infer_epoch_time, info_str = eval_epoch(model, test_dataloader, device, args=args, epoch=epoch)
+            eval_infer_times.append(infer_epoch_time)
+            if best_R1 <= R1:
+                best_R1 = R1
+                best_e = epoch
+                best_info = info_str
+            logging.info("The best R1 is: {:.4f}, best_e={}\n".format(best_R1, best_e))
+            # save checkpoint
+            ckpt_dict = {
+                    'epoch': epoch + 1,
+                    'global_step': global_step,
+                    'arch': 'UnifiedTempMeSTOP',
+                    'state_dict': model.state_dict(),
+                    'best_acc1': best_R1,
+                    'optimizer': optimizer.state_dict(),
+                }
+            if scaler is not None: ckpt_dict['scaler'] = scaler.state_dict()
+            save_checkpoint(ckpt_dict, best_R1 <= R1, args.output_dir, filename='ckpt.pth.tar')
+
+    all_time = time.time() - all_start
+
+    if is_master():
+        logging.info('The total running time of the program is {:.1f} Hour {:.1f} Minute\n'.format(all_time // 3600, 
+                    all_time % 3600 / 60))
+        logging.info('The average inference time of {} runs is {:.2f} Seconds\n'.format(args.epochs, np.mean(eval_infer_times)))
+        logging.info('The maximum GPU memory occupied by this program is {:.2f} GB\n'.format(
+                    torch.cuda.max_memory_allocated(0) * 1.0 / 1024 / 1024 / 1024))
+        logging.info("The best R1 is: {:.4f}, best_epoch={}\n".format(best_R1, best_e))
+        for info in best_info:
+            logging.info(info)
+        print("The above program id is {}\n".format(args.output_dir))
+
+
+def train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_step,
+                scheduler=None, scaler=None, tf_writer=None):
+    samples_per_epoch = len(train_dataloader.dataset)
+
+    # torch.cuda.empty_cache()
+    model.train()
+
+    if epoch == 0 and is_master():
+        no_clip = args.new_added_modules
+        trainable_size =0
+        total_param_size  = 0  
+        for name, param in model.module.named_parameters():
+            if param.requires_grad==True:
+                total_param_size += param.numel() 
+                trainable_size += param.numel() 
+                param_size_MB = param.numel()/(1000**2)
+                # logging.info(f'trainerble parameters are: {name}, size is {param_size_MB:.4f} MB')
+            else:
+                total_param_size += param.numel() 
+        trainable_size_MB = trainable_size/(1000**2)
+        total_param_size_MB = total_param_size/(1000**2)
+        percentage = (trainable_size / total_param_size)*100
+        # logging.info("Trainable param percentage are: {}".format(percentage))
+        # logging.info("Trainable params are: {} MB, Total params are: {} MB".format(trainable_size_MB,total_param_size_MB))
+
+
+    total_loss = 0
+
+    end = time.time()
+
+    for step, batch in enumerate(train_dataloader):
+        # if step == 1:
+        #     break
+        # logging.info(f"Step: {step}   Batch: {batch}")
+        
+        optimizer.zero_grad()
+        if scheduler is not None: scheduler(optimizer, global_step=global_step)
+        # multi-gpu does scattering it-self
+        if torch.cuda.is_available():
+            batch = tuple(t.to(device=device, non_blocking=True) for t in batch)
+        input_ids, input_mask, segment_ids, video, video_mask = batch
+        data_time = time.time() - end
+        
+        # logging.info(f"Step: {step}   input_ids: {input_ids}")
+        # logging.info(f"Step: {step}   input_mask: {input_mask}")
+        # logging.info(f"Step: {step}   segment_ids: {segment_ids}")
+        # logging.info(f"Step: {step}   video: {video}")
+        # logging.info(f"Step: {step}   video_mask: {video_mask}")
+
+        # forward
+        # with torch.cuda.amp.autocast(enabled=scaler is not None):
+        with torch.amp.autocast('cuda', enabled=scaler is not None):
+            output = model(input_ids, segment_ids, input_mask, video, video_mask)
+            loss = output['loss'].mean()
+            #cluster_loss = output['cluster_loss'].mean()
+            sim_loss = output['sim_loss'].mean()
+
+        if args.gradient_accumulation_steps > 1:
+            loss = loss / args.gradient_accumulation_steps
+            
+        # logging.info(f"Step: {step}   Loss: {loss}")
+        # logging.info(f"Step: {step}   Sim_Loss: {sim_loss}")
+
+        # update weights
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                if args.clip_grad_norm is not None:
+                    # we should unscale the gradients of optimizer's assigned params if do gradient clipping
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+        else:
+            loss.backward()
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                if args.clip_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+                optimizer.step()
+
+        # CLIP-style logit_scale clamp - Note: we clamp to 4.6052 = ln(100), as in the original paper.
+        if hasattr(model, 'module'):
+            torch.clamp_(model.module.clip.logit_scale.data, 0.1, 4.6052)
+        else:
+            torch.clamp_(model.clip.logit_scale.data, 0.1, 4.6052)
+
+        batch_time = time.time() - end
+        end = time.time()
+        if (step + 1) % args.gradient_accumulation_steps == 0:
+            global_step += 1
+            if global_step % args.n_display == 0 and is_master():
+                num_samples = (step + 1) * len(input_ids) * args.world_size
+                percent_complete = num_samples * 1.0 / samples_per_epoch * 100
+                logit_scale_data = model.module.clip.logit_scale.data if hasattr(model, 'module') \
+                                    else model.clip.logit_scale.data
+                lr_tmp = optimizer.param_groups[0]['lr'] if args.optim == 'AdamW' else \
+                            optimizer.get_lr()[0]
+                
+                logging.info(
+                    f"Epoch: {epoch} [{num_samples} ({percent_complete:.1f}%)]\t"
+                    f"SimLoss: {sim_loss.item():.4f} \t"
+                    #f"SimLoss: {sim_loss.item():.4f} CLoss {cluster_loss.item():.4f}\t"
+                    f"Data (t) {data_time:.3f}\tBatch (t) {batch_time:.3f}"
+                    f"\tLR: {lr_tmp:.1e}\tlogit_scale {logit_scale_data:.3f}"
+                )
+                # tensorboard log
+                log_data = {
+                    "sim_loss": sim_loss.item(),
+                    #"cluster_loss": cluster_loss.item(),
+                    "data_time": data_time,
+                    "batch_time": batch_time,
+                    "scale": logit_scale_data.item(),
+                    "lr": lr_tmp
+                }
+                for name, val in log_data.items():
+                    name = "train/" + name
+                    if tf_writer is not None:
+                        tf_writer.add_scalar(name, val, global_step=global_step)
+
+        total_loss += float(loss)
+
+    total_loss = total_loss / len(train_dataloader)
+
+    return total_loss, global_step
+
+
+def eval_epoch(model, test_dataloader, device, args=None, epoch=0):
+    """evaluation with retrieval metrics (R@K) and multi-sentence evaluation support"""
+
+    # #################################################################
+    ## below variables are used to multi-sentences retrieval
+    # multi_sentence_: important tag for eval
+    # cut_off_points: used to tag the label when calculate the metric
+    # sentence_num: used to cut the sentence representation
+    # video_num: used to cut the video representation
+    # #################################################################
+    multi_sentence_ = False
+    cut_off_points_, sentence_num_, video_num_ = [], -1, -1
+    if hasattr(test_dataloader.dataset, 'multi_sentence_per_video') \
+            and test_dataloader.dataset.multi_sentence_per_video:
+        multi_sentence_ = True
+        cut_off_points_ = test_dataloader.dataset.cut_off_points
+        sentence_num_ = test_dataloader.dataset.sentence_num
+        video_num_ = test_dataloader.dataset.video_num
+        cut_off_points_ = [itm - 1 for itm in cut_off_points_]
+
+    if multi_sentence_ and is_master():
+        logging.info("Eval under the multi-sentence per video clip setting.")
+        logging.info("sentence num: {}, video num: {}".format(sentence_num_, video_num_))
+
+    model.eval()
+    with torch.no_grad():
+        batch_list_t = []
+        batch_list_v = []
+        batch_sequence_output_list, batch_visual_output_list = [], []
+        total_video_num = 0
+
+        # ----------------------------
+        # 1. cache the features
+        # ----------------------------
+        infer_start_t = time.time()
+        for bid, batch in enumerate(test_dataloader):
+            batch = tuple(t.to(device) for t in batch)
+            input_ids, input_mask, segment_ids, video, video_mask = batch
+            if args.save_feature_path is not None and os.path.exists(args.save_feature_path):
+                if bid < 2000:
+                    if args.datatype == 'msrvtt':
+                        print('{}\t'.format(bid + 1), test_dataloader.dataset.data['video_id'].values[bid], end='\n')
+                    if args.datatype == 'lsmdc':
+                        if 'Harry_Potter' in test_dataloader.dataset.iter2video_pairs_dict[bid][0]:
+                            print('{}\t'.format(bid + 1), test_dataloader.dataset.iter2video_pairs_dict[bid], end='\n')
+
+            if multi_sentence_:
+                # multi-sentences retrieval means: one clip has two or more descriptions.
+                b, *_t = video.shape
+                sequence_output = model(input_ids, segment_ids, input_mask)['sequence_output']
+                batch_sequence_output_list.append(sequence_output)
+                batch_list_t.append((input_mask, segment_ids,))
+
+                s_, e_ = total_video_num, total_video_num + b
+                filter_inds = [itm - s_ for itm in cut_off_points_ if itm >= s_ and itm < e_]
+
+                if len(filter_inds) > 0:
+                    video, video_mask = video[filter_inds, ...], video_mask[filter_inds, ...]
+                    visual_output = model(video=video, video_mask=video_mask)['visual_output']
+                    batch_visual_output_list.append(visual_output)
+                    batch_list_v.append((video_mask,))
+                total_video_num += b
+            else:
+                output = model(input_ids, segment_ids, input_mask, video, video_mask)
+                batch_sequence_output_list.append(output['sequence_output'])
+                batch_list_t.append((input_mask, segment_ids,))
+
+                batch_visual_output_list.append(output['visual_output'])
+                batch_list_v.append((video_mask,))
+
+            if (bid + 1) % args.n_display == 0 or ( bid + 1) == len(test_dataloader):
+                logging.info("{}/{}\r".format(bid, len(test_dataloader)))
+
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        all_infer_time = time.time() - infer_start_t
+        logging.info('The total model inference time of the program is {:.2f} Seconds\n'.format(all_infer_time))
+        if args.inference_speed_test:
+            return 0
+
+        # ----------------------------------
+        # 2. calculate the similarity
+        # ----------------------------------
+        sim_matrix = _run_on_single_gpu(model, batch_list_t, batch_list_v, 
+                                            batch_sequence_output_list, batch_visual_output_list, args=args)
+
+    if multi_sentence_:
+        logging.info("before reshape, sim matrix size: {} x {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
+        cut_off_points2len_ = [itm + 1 for itm in cut_off_points_]
+        max_length = max([e_-s_ for s_, e_ in zip([0]+cut_off_points2len_[:-1], cut_off_points2len_)])
+        sim_matrix_new = []
+        for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
+            sim_matrix_new.append(np.concatenate((sim_matrix[s_:e_],
+                                                  np.full((max_length-e_+s_, sim_matrix.shape[1]), -np.inf)), axis=0))
+        sim_matrix = np.stack(tuple(sim_matrix_new), axis=0)
+        logging.info("after reshape, sim matrix size: {} x {} x {}".
+                    format(sim_matrix.shape[0], sim_matrix.shape[1], sim_matrix.shape[2]))
+
+        tv_metrics = tensor_text_to_video_metrics(sim_matrix)
+        vt_metrics = compute_metrics(tensor_video_to_text_sim(sim_matrix))
+
+    else:
+        logging.info("sim matrix size: {}, {}".format(sim_matrix.shape[0], sim_matrix.shape[1]))
+        tv_metrics = compute_metrics(sim_matrix)
+        vt_metrics = compute_metrics(sim_matrix.T)
+        logging.info('\t Length-T: {}, Length-V:{}'.format(len(sim_matrix), len(sim_matrix[0])))
+
+
+    # return for final logging with retrieval metrics (R@K)
+    info_str = []
+    info_str.append("Text-to-Video:")
+    info_str.append(' (metric) >>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
+                format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['MR'], tv_metrics['MeanR']))
+    info_str.append("Video-to-Text:")
+    info_str.append(' (metric) >>>  V2T$R@1: {:.1f} - V2T$R@5: {:.1f} - V2T$R@10: {:.1f} - V2T$Median R: {:.1f} - V2T$Mean R: {:.1f}'.
+                format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['MR'], vt_metrics['MeanR']))
+
+    for info in info_str: logging.info(info)
+    R1 = tv_metrics['R1']
+
+    return R1, all_infer_time, info_str
+
+
+def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_visual_output_list, args=None):
+    """"calculate the similarity between visual output and text output"""
+    if hasattr(model, 'module'):
+        model = model.module
+    else:
+        model = model
+
+    sim_matrix = []
+    
+    for idx1, b1 in enumerate(batch_list_t):
+        input_mask, segment_ids, *_tmp = b1
+        sequence_output = batch_sequence_output_list[idx1]
+        each_row = []
+        for idx2, b2 in enumerate(batch_list_v):
+            video_mask, *_tmp = b2
+            visual_output = batch_visual_output_list[idx2]
+            b1b2_logits, *_tmp = model.get_similarity_logits(sequence_output, visual_output, input_mask, video_mask)
+            b1b2_logits = b1b2_logits.cpu().detach().numpy()
+            each_row.append(b1b2_logits)
+        each_row = np.concatenate(tuple(each_row), axis=-1)
+        sim_matrix.append(each_row)
+    
+    sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
+
+    # if args.camoe_dsl:
+    # 	print('Apply DSL')
+    # 	# https://github.com/starmemda/CAMoE
+    # 	sim_matrix_ = torch.from_numpy(sim_matrix)
+    # 	sim_matrix = sim_matrix_ * F.softmax(sim_matrix_, dim=0) * len(sim_matrix_)
+    # 	# sim_matrix = sim_matrix_ * F.softmax(sim_matrix_, dim=1) * len(sim_matrix_)
+    # 	sim_matrix = sim_matrix.cpu().numpy()
+
+    return sim_matrix
 
 
 if __name__ == "__main__":
-    main()
+    args = get_args()
+
+    main(args)

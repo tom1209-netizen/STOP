@@ -189,6 +189,16 @@ def get_args(description='DGL on Retrieval Task'):
     parser.add_argument('--freeze_clip', type=int, default=0,
                             help="Whether freeze all clip backbone.")
 
+    parser.add_argument('--freeze_substrings', type=str, nargs='*', default=None,
+                            help="List of substrings to match parameter names for freezing. "
+                                 "Parameters containing these substrings will be frozen. "
+                                 "Example: --freeze_substrings visual.transformer text.transformer")
+
+    parser.add_argument('--keep_substrings', type=str, nargs='*', default=None,
+                            help="List of substrings to match parameter names to keep trainable. "
+                                 "Takes priority over freeze_substrings. "
+                                 "Example: --keep_substrings logit_scale LoRA")
+
     # divide the pretrained temperature
     parser.add_argument('--temperature_new', type=float, default=1.0,
                             help='assign a new temperature to CLIP model')
