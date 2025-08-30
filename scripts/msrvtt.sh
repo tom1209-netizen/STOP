@@ -1,5 +1,13 @@
 #!/bin/bash
 export CUDA_VISIBLE_DEVICES=0
+
+# Suppress TensorFlow and CUDA verbose messages
+export TF_CPP_MIN_LOG_LEVEL=3               # Suppress TensorFlow info/warning/error messages
+export TF_ENABLE_ONEDNN_OPTS=0              # Disable oneDNN custom operations
+export CUDA_LAUNCH_BLOCKING=0               # Disable CUDA launch blocking
+export PYTHONWARNINGS="ignore"              # Suppress Python warnings
+export TOKENIZERS_PARALLELISM=false         # Suppress tokenizers parallelism warnings
+
 echo "Using local machine for training"
 
 
@@ -18,7 +26,7 @@ train_csv=${DATA_PATH}/annotation/MSRVTT_train.9k.csv
 # training-9k
 val_csv=${DATA_PATH}/annotation/MSRVTT_JSFUSION_test.csv
 features_path=${DATA_PATH}/compressed_videos/
-pretrained_dir=/content/stop-implementation/modules
+pretrained_dir=/content/STOP/modules
 
 # train or eval
 do_train=1
@@ -74,8 +82,9 @@ frame_pos=0                      # Whether to use frame positional embeddings (0
 current_datetime=$(TZ="Asia/Tokyo" date +"%Y-%m-%d-%H:%M:%S")
 model_dir=/content/logs/${current_datetime}_${dataset}_STOP
 echo "The model dir is ${model_dir}"
-# CUDA_LAUNCH_BLOCKING=1
-python  main.py \
+
+# Redirect stderr to filter out CUDA/TensorFlow verbose messages
+python main.py \
         --do_train ${do_train} \
         --do_eval ${do_eval} \
         --num_thread_reader ${num_workers} \
@@ -117,7 +126,7 @@ python  main.py \
         --merge_layers ${merge_layers} \
         --merge_frame_nums ${merge_frame_nums} \
         --merge_token_proportions ${merge_token_proportions} \
-        --frame_pos ${frame_pos}
+        --frame_pos ${frame_pos} 2>&1 | grep -v -E "(Unable to register|computation placer already registered|This TensorFlow binary is optimized|oneDNN custom operations|All log messages before absl::InitializeLog)"
 
 
 echo "Training Finished!!!"
