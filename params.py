@@ -221,6 +221,24 @@ def get_args(description='DGL on Retrieval Task'):
     
     parser.add_argument('--temporal_prompt', type=str, default="DGL")
     
+    # ToMe (Token Merging) parameters
+    parser.add_argument('--tome_r', type=int, default=0,
+                            help="Number of tokens to merge per layer (0 to disable ToMe)")
+    parser.add_argument('--tome_trace_source', action='store_true', default=False,
+                            help="Whether to trace source tokens for ToMe (useful for debugging)")
+    parser.add_argument('--tome_prop_attn', action='store_true', default=True,
+                            help="Whether to propagate attention with size information in ToMe")
+    
+    # Inter-frame merging parameters
+    parser.add_argument('--merge_layers', type=str, default="3-6-9",
+                            help="Layers where inter-frame merging occurs (e.g., '3-6-9')")
+    parser.add_argument('--merge_frame_nums', type=str, default="2-2-2", 
+                            help="Frame merge ratios for each merge layer (e.g., '2-2-2')")
+    parser.add_argument('--merge_token_proportions', type=str, default="10-10",
+                            help="Token merge proportions as percentages: 'inter_frame-intra_frame' (e.g., '10-10')")
+    parser.add_argument('--frame_pos', type=int, default=0, choices=[0, 1],
+                            help="Whether to use frame positional embeddings in ToMe (0=no, 1=yes)")
+    
     
     args = parser.parse_args()
 
@@ -260,6 +278,19 @@ def get_args(description='DGL on Retrieval Task'):
     args.new_added_modules += ["visual.TemporalPrompt"]
     if args.lora:
         args.new_added_modules += ["LoRA"]
+
+    # Process ToMe inter-frame merging parameters
+    if args.tome_r > 0:
+        # Parse merge_layers string to list of integers
+        args.merge_layers = [int(x) for x in args.merge_layers.split('-')] if args.merge_layers else [3, 6, 9]
+        # Parse merge_frame_nums string to list of integers  
+        args.merge_frame_nums = [int(x) for x in args.merge_frame_nums.split('-')] if args.merge_frame_nums else [2, 2, 2]
+        # Parse merge_token_proportions string to list of floats (convert percentages)
+        if args.merge_token_proportions:
+            proportions = [float(x)/100.0 for x in args.merge_token_proportions.split('-')]
+            args.merge_token_proportions = proportions
+        else:
+            args.merge_token_proportions = [0.1, 0.1]  # Default 10% each
 
     # If some params are not passed, we use the default values based on model name.
     default_params = get_default_params(args.pretrained_clip_name)

@@ -13,6 +13,8 @@ from .module_cross import CrossConfig, CrossModel
 from .utils import all_gather, log_info, update_attr
 from .clip import build_clip_model, load_clip_state_dict
 from .module_cross import Transformer as TransformerClip
+from .tome_patch import apply_tome_patch
+from .tome_utils import parse_r, init_tome_info
 ##add for efficient prompt
 from collections import OrderedDict
 import einops
@@ -244,6 +246,40 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                                                     heads=clip_config['transformer_heads'])
 
         self.loss_fct = CrossEn()
+        
+        # Initialize ToMe if specified in task_config
+        self.tome_r = getattr(task_config, "tome_r", 0)
+        self.tome_trace_source = getattr(task_config, "tome_trace_source", False)
+        self.tome_prop_attn = getattr(task_config, "tome_prop_attn", True)
+        
+        # Inter-frame merging configuration
+        self.merge_layers = getattr(task_config, "merge_layers", [3, 6, 9])
+        self.merge_frame_nums = getattr(task_config, "merge_frame_nums", [2, 2, 2])
+        self.merge_token_proportions = getattr(task_config, "merge_token_proportions", [0.1, 0.1])
+        self.frame_pos = getattr(task_config, "frame_pos", 0)
+        
+        if self.tome_r > 0:
+            log_info(f"Applying ToMe patch with r={self.tome_r}")
+            log_info(f"Inter-frame merging at layers: {self.merge_layers}")
+            log_info(f"Frame merge ratios: {self.merge_frame_nums}")
+            log_info(f"Token merge proportions: {self.merge_token_proportions}")
+            
+            apply_tome_patch(
+                self.clip, 
+                trace_source=self.tome_trace_source, 
+                prop_attn=self.tome_prop_attn, 
+                tome_r=self.tome_r,
+                merge_layers=self.merge_layers,
+                merge_frame_nums=self.merge_frame_nums,
+                merge_token_proportions=self.merge_token_proportions,
+                frame_pos=self.frame_pos
+            )
+            # Initialize tome info with video parameters
+            init_tome_info(
+                self.clip, 
+                max_frames=self.video_frames or 12,
+                initial_tokens=197 if 'ViT-B' in getattr(task_config, 'pretrained_clip_name', 'ViT-B/32') else 50
+            )
         
 
     def forward(self, input_ids=None, token_type_ids=None, attention_mask=None, video=None, video_mask=None,
