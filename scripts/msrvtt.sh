@@ -41,14 +41,14 @@ wd=0.2
 epochs=5
 optim=AdamW
 max_words=32
-max_frames=40
+max_frames=40               
 temperature_new=1.0
 resume=None
 load_from_pretrained=0
-batch_size=64           # single GPU batch size
-batch_size_val=16
+batch_size=32           
+batch_size_val=8    
 num_workers=8
-n_display=50            # log per n_display
+n_display=50            
 precision=amp
 
 freeze_clip=1
@@ -63,21 +63,10 @@ tome_trace_source=false           # Whether to trace source tokens for debugging
 tome_prop_attn=true              # Whether to propagate attention with size information
 
 # Inter-frame merging configuration
-merge_layers="3-6-9"             # Layers where inter-frame merging occurs
-merge_frame_nums="2-2-2"         # Frame merge ratios for each merge layer
-merge_token_proportions="10-10"  # Token merge proportions: inter_frame%-intra_frame%
-frame_pos=0                      # Whether to use frame positional embeddings (0=no, 1=yes)
-
-# Alternative ToMe configurations (uncomment to use):
-# Conservative (high accuracy): tome_r=1, merge_layers="6-9", merge_frame_nums="2-2", merge_token_proportions="5-5"
-# Aggressive (max speed): tome_r=4, merge_layers="2-4-6-8-10", merge_frame_nums="2-2-3-3-3", merge_token_proportions="15-15"
-# Disable ToMe: tome_r=0
-
-# distributed training
-# init_method='tcp://127.0.0.1:6010'
-
-
-
+merge_layers="6-9-11"            # Only merge frames in later layers (preserve early temporal info)
+merge_frame_nums="2-2-2"         # Gentle frame merging: 40→20→10→5 frames
+merge_token_proportions="8-12"   # More focus on intra-frame (12%) vs inter-frame (8%) merging
+frame_pos=0                        # Whether to use frame positional embeddings (0=no, 1=yes)
 
 current_datetime=$(TZ="Asia/Tokyo" date +"%Y-%m-%d-%H:%M:%S")
 model_dir=/content/logs/${current_datetime}_${dataset}_STOP
