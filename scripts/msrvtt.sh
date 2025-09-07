@@ -46,11 +46,11 @@ time_embedding=0
 shared_latent_space=transformer
 
 # --- TempMe parameters ---
-tome_r: 0
-merge_layer: '9-10-11'
-merge_frame_num: '2-2-2'
-merge_token_proportion: '50-50'
-frame_pos: 1
+tome_r=0
+merge_layer='9-10-11'
+merge_frame_num='2-2-2'
+merge_token_proportion='50-50'
+frame_pos=1
 
 # distributed training
 init_method='tcp://127.0.0.1:6010'

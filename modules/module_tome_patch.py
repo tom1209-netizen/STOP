@@ -13,7 +13,7 @@ from typing import Tuple, Union, List
 
 import torch
 import torch.nn.functional as F
-from .module_clip import Attention, ResidualAttentionBlock, CLIP
+from .clip import Attention, ResidualAttentionBlock, CLIP
 from .module_tome_merge import bipartite_soft_matching, merge_source, merge_wavg
 import logging
 
